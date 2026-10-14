@@ -1,0 +1,14 @@
+[project]
+name = "invest-research-team"
+version = "0.1.0"
+description = "投资研究 multi-agent 系统（LangGraph 骨架）"
+requires-python = ">=3.11"
+dependencies = ["langgraph>=0.2", "openai>=1.0", "python-dotenv>=1.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+data = ["akshare"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
