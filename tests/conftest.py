@@ -1,9 +1,14 @@
-"""pytest 全局配置：保证测试确定性 —— 不加载 .env 的真实 key。"""
+"""pytest 全局配置：保证测试确定性 —— 不加载 .env 的真实 key、不做 CA 引导。"""
 
 import os
 
 import pytest
 from dotenv import load_dotenv
+
+# 必须在任何 src.tools 模块被导入之前设置：utils 导入时会做 ASCII CA 引导
+# （中文路径下把 certifi 的 CA 复制到 ASCII 目录并设环境变量），单元测试不该
+# 在仓库外落文件，故整体跳过；需要验证该机制时由测试自己 monkeypatch 打开。
+os.environ["IR_SKIP_CA_BOOTSTRAP"] = "1"
 
 
 @pytest.fixture(autouse=True)

@@ -4,9 +4,19 @@
 且取到的必须是**最新报告期**的数据——下游要把它直接塞进 LLM prompt。
 """
 
-import math
-from datetime import date, datetime
 from typing import Protocol
+
+from src.tools.utils import (
+    clean_metrics,
+    clean_value,
+    fetch_with_retry,
+    period_key,
+    pick_latest_row,
+)
+
+# 兼容旧导入路径：历史测试与脚本按私有名从本模块导入这两个清洗函数。
+_clean_value = clean_value
+_period_key = period_key
 
 
 class DataProvider(Protocol):
@@ -30,39 +40,8 @@ class FakeProvider:
         return self.mapping[ticker]
 
 
-def _clean_value(value):
-    """numpy / NaN 清洗：把数字（含数字字符串）归一成纯 Python float，NaN、inf 返回 None。
-
-    必要性：
-    1. akshare 返回 numpy 标量，NaN 经 json.dumps(default=str) 会变成字符串
-       "nan"——那是**非法 JSON**，会让 LLM 拿到脏上下文并解析失败；
-    2. 有的接口把数字给成字符串（如 "63.6525"），统一成 float 才能比较与计算。
-    清洗不掉的非数字文本按原样返回（例如 "--"），由上游决定怎么用。
-    """
-    if value is None:
-        return None
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            return None
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    if math.isnan(num) or math.isinf(num):
-        return None
-    return num
-
-
-def _period_key(value) -> str:
-    """把报告期归一化成可比较的 YYYYMMDD 字符串（空值 -> ""）。"""
-    if isinstance(value, datetime | date):
-        return value.strftime("%Y%m%d")
-    text = str(value or "").strip()
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return digits[:8] if len(digits) >= 8 else ""
-
-
+# 数值清洗与最新期选取已抽到 src/tools/utils.py（clean_value / period_key /
+# pick_latest_row / clean_metrics），各 Provider 共用。
 class AkshareProvider:
     """akshare 真实数据源（延迟导入：import akshare 放在方法内）。
 
@@ -91,34 +70,34 @@ class AkshareProvider:
     def get_financials(self, ticker: str) -> dict:
         import akshare as ak  # 延迟导入
 
-        df = ak.stock_financial_analysis_indicator(symbol=ticker)
+        df = fetch_with_retry(
+            lambda: ak.stock_financial_analysis_indicator(symbol=ticker),
+            label="stock_financial_analysis_indicator",
+        )
         if df is None or df.empty:
             raise RuntimeError(f"akshare 未返回数据: {ticker}")
         if "日期" not in df.columns:
             raise RuntimeError(f"akshare 返回结构与预期不符，列: {list(df.columns)[:20]}")
 
         # 该接口按报告期**升序**返回（首行是最老的年报），必须自己挑最新一期。
-        periods = df["日期"].map(_period_key)
-        if periods.eq("").all():
-            raise RuntimeError(f"akshare 报告期列无法解析: {list(df['日期'].head(5))}")
-        latest = df.loc[periods.idxmax()]
+        try:
+            latest, date_raw = pick_latest_row(df)
+        except ValueError as exc:
+            raise RuntimeError(f"akshare 报告期列无法解析: {list(df['日期'].head(5))}") from exc
 
-        date_raw = str(latest.get("日期")).strip()
-        as_of = _period_key(latest.get("日期"))[:6]
+        as_of = period_key(latest.get("日期"))[:6]
         as_of = f"{as_of[:4]}-{as_of[4:]}" if len(as_of) == 6 else date_raw
 
+        metric_values, missing_metrics = clean_metrics(latest, self.METRIC_MAP)
+        raw_values, _ = clean_metrics(latest, self.RAW_FIELDS)
+
         out = {"ticker": ticker, "source": self.SOURCE}
-        for cn_name, field in self.METRIC_MAP.items():
-            value = _clean_value(latest.get(cn_name))
-            if value is not None:
-                out[field] = {"value": value, "as_of": as_of}
-        for cn_name, field in self.RAW_FIELDS.items():
-            value = _clean_value(latest.get(cn_name))
-            if value is not None:
-                out[field] = value
+        for field, value in metric_values.items():
+            out[field] = {"value": value, "as_of": as_of}
+        out.update(raw_values)
         out["report_period"] = date_raw
         out["as_of"] = as_of
-        out["missing_metrics"] = sorted(set(self.METRIC_MAP.values()) - set(out))
+        out["missing_metrics"] = sorted(missing_metrics)
 
         if all(f not in out for f in self.REQUIRED_ANY):
             raise RuntimeError(

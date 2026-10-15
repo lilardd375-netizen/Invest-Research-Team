@@ -25,15 +25,42 @@ class KeyPoint(BaseModel):
     data_source: str
 
 
-class FinancialAnalysisModel(BaseModel):
-    """财务分析 Agent 的输出结构。"""
+class AnalysisBase(BaseModel):
+    """四个分析师 Agent 的公共输出结构。
 
-    agent: Literal["financial_analyst"] = "financial_analyst"
+    conclusion 三档跨 Agent 统一，是为了第八步报告合成时能把四家结论聚合比较；
+    各子类只固定 agent 字段，不得改变其余字段的语义。
+    """
+
     conclusion: Literal["增持", "中性", "减持"]
     confidence: Literal["高", "中", "低"]
     key_points: list[KeyPoint] = Field(default_factory=list)
     concerns: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
+
+
+class FinancialAnalysisModel(AnalysisBase):
+    """财务分析 Agent 的输出结构。"""
+
+    agent: Literal["financial_analyst"] = "financial_analyst"
+
+
+class IndustryAnalysisModel(AnalysisBase):
+    """行业分析 Agent 的输出结构（板块归属、板块表现、同业对比）。"""
+
+    agent: Literal["industry_analyst"] = "industry_analyst"
+
+
+class SentimentAnalysisModel(AnalysisBase):
+    """舆情分析 Agent 的输出结构（近期新闻与市场情绪）。"""
+
+    agent: Literal["sentiment_analyst"] = "sentiment_analyst"
+
+
+class TechnicalAnalysisModel(AnalysisBase):
+    """技术面分析 Agent 的输出结构（均线、区间位置、量能）。"""
+
+    agent: Literal["technical_analyst"] = "technical_analyst"
 
 
 class Challenge(BaseModel):

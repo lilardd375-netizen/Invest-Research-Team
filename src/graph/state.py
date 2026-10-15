@@ -21,8 +21,14 @@ class ResearchState(TypedDict):
     planner_error: NotRequired[str]
     analyst_error: NotRequired[str]
     risk_error: NotRequired[str]
-    # revise 分发下来的待办质询：target_agent -> list[dict]
-    pending_challenges: NotRequired[dict]
+    # revise 分发下来的待办质询：target_agent -> list[dict]。
+    # 并行分析师各自清自己的 key 会在同一步写这个字段，所以必须是 or_ reducer。
+    pending_challenges: NotRequired[_MergeDict]
+    # 三个新分析 Agent 的降级摘要：agent -> 错误字符串。
+    # 财务 Agent 的单数 analyst_error 是 LastValue 且全图只有财务节点写它，
+    # 不会冲突，保持不动；新 Agent 并行降级时可能同一步写多份，必须用 reducer，
+    # 否则报 "Can receive only one value per step"。
+    analyst_errors: NotRequired[_MergeDict]
 
 
 def merge_dict(left: Union[dict, None], right: Union[dict, None]) -> dict:

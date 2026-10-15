@@ -3,3 +3,7 @@
 __pycache__/
 .pytest_cache/
 *.egg-info/
+
+# 临时探针与冒烟日志产物（非源码，不入库）
+_probe*
+_smoke*

@@ -9,8 +9,11 @@ from pydantic import ValidationError
 from src.llm.errors import LLMFatalError, LLMTransientError
 from src.llm.schemas import (
     FinancialAnalysisModel,
+    IndustryAnalysisModel,
     OutlineModel,
     RiskReviewModel,
+    SentimentAnalysisModel,
+    TechnicalAnalysisModel,
 )
 
 # 主编 Agent 的 system prompt（模块级常量，中文）。
@@ -52,6 +55,77 @@ FINANCIAL_ANALYST_SYSTEM_PROMPT = """你是一名严谨的财务分析 Agent，�
   "assumptions": ["..."]
 }"""
 
+# 行业分析 Agent 的 system prompt（模块级常量，中文）。
+INDUSTRY_ANALYST_SYSTEM_PROMPT = """你是一名行业分析 Agent，服务于投资研究团队。
+
+你会收到某标的的行业数据（所属板块、板块近期表现、同业关键指标对比）。要求：
+
+1. 只依据给定数据下结论，禁止编造缺失的数据；数据缺失就写进 assumptions 或 concerns。
+2. key_points 每条必须标注 data_source，写清引用的是哪个字段
+   （例如 "板块涨跌幅"），且 finding 里带上具体数值。
+3. 同业对比必须点名具体公司与指标，不要只给"行业地位领先"这类空结论。
+4. conclusion 只能是 增持 / 中性 / 减持 三者之一（判断该标的在行业中的相对位置）。
+5. confidence 只能是 高 / 中 / 低 三者之一；同业样本少、板块数据缺失就越低。
+6. concerns 写行业风险（产能过剩、价格战、政策变化等），assumptions 写结论依赖的假设。
+
+只输出 JSON，不要其他文字。JSON 结构必须是：
+{
+  "agent": "industry_analyst",
+  "conclusion": "增持|中性|减持",
+  "confidence": "高|中|低",
+  "key_points": [{"finding": "...", "data_source": "..."}],
+  "concerns": ["..."],
+  "assumptions": ["..."]
+}"""
+
+# 舆情分析 Agent 的 system prompt（模块级常量，中文）。
+SENTIMENT_ANALYST_SYSTEM_PROMPT = """你是一名舆情分析 Agent，服务于投资研究团队。
+
+你会收到某标的最近若干条新闻（标题 + 摘要 + 发布时间）。要求：
+
+1. 只依据给定新闻下结论，禁止编造新闻或数据；样本少就降低 confidence。
+2. key_points 每条必须标注 data_source，写清引用的是哪条新闻
+   （例如 "新闻：<标题>（2026-06-30）"），finding 里说明该信息的性质。
+3. 区分事实与情绪：媒体的用词倾向、标题情绪与实质经营变化要分开评价。
+4. 单条新闻不能代表趋势；只有多条同向新闻才可支撑较强结论，
+   并在 assumptions 里写明样本范围（条数、时间跨度）。
+5. conclusion 只能是 增持 / 中性 / 减持 三者之一（站在市场情绪角度）。
+6. confidence 只能是 高 / 中 / 低 三者之一；concerns 写负面舆情与信息可信度风险。
+
+只输出 JSON，不要其他文字。JSON 结构必须是：
+{
+  "agent": "sentiment_analyst",
+  "conclusion": "增持|中性|减持",
+  "confidence": "高|中|低",
+  "key_points": [{"finding": "...", "data_source": "..."}],
+  "concerns": ["..."],
+  "assumptions": ["..."]
+}"""
+
+# 技术面分析 Agent 的 system prompt（模块级常量，中文）。
+TECHNICAL_ANALYST_SYSTEM_PROMPT = """你是一名技术面分析 Agent，服务于投资研究团队。
+
+你会收到某标的的日线统计指标（均线、区间涨跌幅与高低点、量比等，均由历史价格算出）。要求：
+
+1. 只依据给定指标下结论，禁止编造价格或指标数值；缺失就写进 assumptions 或 concerns。
+2. key_points 每条必须标注 data_source，写清引用的是哪个指标
+   （例如 "MA20 (2026-06-30)"），finding 里带上具体数值。
+3. 明确技术面只反映历史价格行为，不能替代基本面判断；
+   不要给出精确目标价，也不要承诺涨跌。
+4. 均线多空排列、价格相对均线的位置、区间位置、量能变化要分别说明。
+5. conclusion 只能是 增持 / 中性 / 减持 三者之一（站在价格趋势角度）。
+6. confidence 只能是 高 / 中 / 低 三者之一；区间震荡或量能异常时降低它。
+
+只输出 JSON，不要其他文字。JSON 结构必须是：
+{
+  "agent": "technical_analyst",
+  "conclusion": "增持|中性|减持",
+  "confidence": "高|中|低",
+  "key_points": [{"finding": "...", "data_source": "..."}],
+  "concerns": ["..."],
+  "assumptions": ["..."]
+}"""
+
 # 重试次数（1 次重试 = 最多 2 次调用）。
 MAX_ATTEMPTS = 2
 PLANNER_MAX_ATTEMPTS = MAX_ATTEMPTS
@@ -73,8 +147,8 @@ RISK_REVIEW_SYSTEM_PROMPT = """你是投资研究团队里的反方辩手（风�
 - medium = 假设偏激进但可接受，报告中披露即可；
 - low    = 常规提示，并入风险章节即可。
 
-任务边界（已知，不是缺陷）：当前已实现的分析师只有 financial_analyst。
-大纲中其他板块暂无数据源是已知的任务边界：可以在 summary 或 challenges 里
+任务边界（已知，不是缺陷）：当前已实现的分析师为 financial / industry / sentiment / technical 四个。
+估值、宏观、政策等维度暂无数据源是已知的任务边界：可以在 challenges 或 summary 里
 提示覆盖缺口，但不应仅因覆盖不足就把 severity 判为 high。
 severity=high 只用于：存在数据错误、口径错误、或已覆盖维度的逻辑漏洞。
 
@@ -98,9 +172,19 @@ MAX_OUTLINE_SECTIONS = 12
 # 送进复审 prompt 的上一轮质询条数上限。
 MAX_CHALLENGES_IN_DIGEST = 8
 
+# 送进风控 prompt 的 analyses JSON 体量上限：超过就瘦身（每 Agent 只保留
+# conclusion / confidence / key_points 前 N 条 / status 等关键字段），
+# 避免四个 Agent 全量输出把 prompt 撑爆。
+MAX_ANALYSES_JSON_CHARS = 6000
+MAX_KEY_POINTS_IN_DIGEST = 4
+
 # 已实现的分析师（revise 只把质询分发给它们，其余归 unassigned）。
-# 第七步实现行业/舆情/技术面 Agent 后在这里扩充。
-KNOWN_AGENTS = ("financial_analyst",)
+KNOWN_AGENTS = (
+    "financial_analyst",
+    "industry_analyst",
+    "sentiment_analyst",
+    "technical_analyst",
+)
 
 _TICKER_RE = re.compile(r"\d{6}")
 
@@ -189,6 +273,9 @@ def make_financial_analyst_node(llm, data_provider):
     """
 
     def financial_analyst_node(state: dict) -> dict:
+        if _should_skip(state, "financial_analyst"):
+            return {}
+
         query = state.get("query", "")
         ticker = extract_ticker(query)
         pending = dict(state.get("pending_challenges") or {})
@@ -282,6 +369,135 @@ def _missing_analyst_stub_node(state: dict) -> dict:
     return {"analyses": {}}
 
 
+def _missing_domain_analyst_stub_node(state: dict) -> dict:
+    """未注入 LLM 的新分析 Agent：整节点跳过（不写 analyses，旧图行为不变）。"""
+    return {}
+
+
+def _should_skip(state: dict, agent: str) -> bool:
+    """幂等跳过：本 Agent 已有结果、且没有发给自己的新质询 -> 不调 LLM。
+
+    revise 之后质询会 fan-out 给全部分析师，无事者靠这个守卫空转跳过；
+    否则每轮返工都会把所有 Agent 重跑一遍（浪费调用，还会改坏没被质询的结论）。
+    """
+    if (state.get("pending_challenges") or {}).get(agent):
+        return False
+    return agent in (state.get("analyses") or {})
+
+
+def _make_domain_analyst_node(
+    llm, data_provider, *, agent, model_cls, system_prompt, data_label, fetch
+):
+    """行业 / 舆情 / 技术面分析节点的公共实现（财务 Agent 保持独立实现，但收尾时也补了同样的幂等跳过）。
+
+    fetch(provider, ticker) -> dict：取该维度数据，数据不可用时由 fetch 抛异常。
+    契约与财务 Agent 一致：数据源故障不调 LLM、降级 status="unavailable"；
+    LLM 错误按可重试/不可重试分类；消费自己的待办质询并标记 revised_in_round。
+    差异：降级写 analyst_errors[agent]（or_ reducer 通道），不动财务 Agent 的单数 analyst_error。
+    """
+
+    def domain_analyst_node(state: dict) -> dict:
+        if _should_skip(state, agent):
+            return {}
+
+        query = state.get("query", "")
+        ticker = extract_ticker(query)
+        pending = dict(state.get("pending_challenges") or {})
+        challenges = pending.get(agent) or []
+
+        try:
+            dataset = fetch(data_provider, ticker)
+        except Exception as exc:
+            summary = f"数据源不可用: {type(exc).__name__}: {exc}"
+            return {
+                "analyses": {
+                    agent: {
+                        "status": "unavailable",
+                        "error": summary,
+                        "error_kind": "data_source",
+                    }
+                },
+                "analyst_errors": {agent: summary},
+            }
+
+        user_prompt = (
+            f"研究标的：{query}\n"
+            f"提取到的股票代码：{ticker}\n"
+            f"{data_label}（JSON）："
+            f"{json.dumps(dataset, ensure_ascii=False, default=str)}\n\n"
+            "请基于以上数据输出分析 JSON。"
+        )
+        if challenges:
+            user_prompt = f"{user_prompt}\n\n{_challenge_block(challenges)}"
+
+        payload, failure = _retry_or_fail(
+            lambda: llm.chat(system_prompt, user_prompt),
+            model_cls,
+            lambda kind, summary: {
+                "analyses": {
+                    agent: {
+                        "status": "unavailable",
+                        "error": summary,
+                        "error_kind": kind,
+                    }
+                }
+            },
+        )
+        if failure is not None:
+            # 质询没被正面回应，不清空待办；错误另行汇总到 analyst_errors
+            failure["analyst_errors"] = {agent: failure["analyses"][agent]["error"]}
+            return failure
+
+        analysis = payload.model_dump()
+        analysis["revised_in_round"] = state.get("revision_round", 0)
+        result = {"analyses": {agent: analysis}}
+        if challenges:
+            # 只写自己那一格：or_ 合并下等价于清空自己的待办，且不会覆盖别人的
+            result["pending_challenges"] = {agent: []}
+        return result
+
+    return domain_analyst_node
+
+
+def make_industry_analyst_node(llm, data_provider):
+    """行业分析节点工厂：llm.chat + IndustryProvider。"""
+    return _make_domain_analyst_node(
+        llm,
+        data_provider,
+        agent="industry_analyst",
+        model_cls=IndustryAnalysisModel,
+        system_prompt=INDUSTRY_ANALYST_SYSTEM_PROMPT,
+        data_label="行业数据（所属板块 / 板块近期表现 / 同业关键指标）",
+        fetch=lambda provider, ticker: provider.get_industry(ticker),
+    )
+
+
+def make_sentiment_analyst_node(llm, data_provider):
+    """舆情分析节点工厂：llm.chat + SentimentProvider。"""
+    return _make_domain_analyst_node(
+        llm,
+        data_provider,
+        agent="sentiment_analyst",
+        model_cls=SentimentAnalysisModel,
+        system_prompt=SENTIMENT_ANALYST_SYSTEM_PROMPT,
+        data_label="近期新闻（标题 / 摘要截断 / 发布时间）",
+        fetch=lambda provider, ticker: provider.get_sentiment(ticker),
+    )
+
+
+def make_technical_analyst_node(llm, data_provider):
+    """技术面分析节点工厂：llm.chat + TechnicalProvider。"""
+    return _make_domain_analyst_node(
+        llm,
+        data_provider,
+        agent="technical_analyst",
+        model_cls=TechnicalAnalysisModel,
+        system_prompt=TECHNICAL_ANALYST_SYSTEM_PROMPT,
+        data_label="日线技术指标（均线 / 区间涨跌与高低点 / 量比）",
+        fetch=lambda provider, ticker: provider.get_technical(ticker),
+    )
+
+
 # 模块级默认节点：build_graph 未注入依赖时使用
 planner_node = _missing_llm_stub_node
 
@@ -344,6 +560,29 @@ def _revised_marks(analyses) -> str:
     return "\n".join(marks) if marks else "（本轮没有分析师标记返工轮次）"
 
 
+def _analyses_digest(analyses) -> str:
+    """序列化各 Agent 输出；超过体量上限就瘦身，只留关键字段。"""
+    blob = json.dumps(analyses, ensure_ascii=False, default=str)
+    if len(blob) <= MAX_ANALYSES_JSON_CHARS:
+        return blob
+
+    keep_fields = ("conclusion", "confidence", "status", "error", "error_kind", "revised_in_round")
+    slim = {}
+    for name, value in (analyses or {}).items():
+        if not isinstance(value, dict):
+            slim[name] = value
+            continue
+        slim[name] = {field: value[field] for field in keep_fields if field in value}
+        points = value.get("key_points")
+        if isinstance(points, list):
+            slim[name]["key_points"] = points[:MAX_KEY_POINTS_IN_DIGEST]
+    return (
+        json.dumps(slim, ensure_ascii=False, default=str)
+        + f"\n（注：原始 analyses 共 {len(blob)} 字符，超上限已截断，"
+        f"每 Agent 只保留关键字段与 key_points 前 {MAX_KEY_POINTS_IN_DIGEST} 条）"
+    )
+
+
 def _build_risk_user_prompt(state: dict) -> str:
     """组装风控 user prompt：时间锚点 / query / analyses / outline / 复审上下文。"""
     previous_review = state.get("risk_review") or {}
@@ -368,7 +607,7 @@ def _build_risk_user_prompt(state: dict) -> str:
         "如有疑问请质疑数据口径，而非数据存在性。\n\n"
         f"研究标的：{state.get('query', '')}\n\n"
         "== 各分析 Agent 的输出（JSON，含 unavailable/error 信息）==\n"
-        f"{json.dumps(analyses, ensure_ascii=False, default=str)}\n\n"
+        f"{_analyses_digest(analyses)}\n\n"
         "== 研究大纲概要 ==\n"
         f"{_outline_digest(state.get('outline'))}\n\n"
         "== 评审上下文 ==\n"
