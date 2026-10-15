@@ -30,18 +30,24 @@ def _named_errors(*names):
 _NETWORK_ERRORS = _named_errors("APIConnectionError", "APITimeoutError")
 _AUTH_ERRORS = _named_errors("AuthenticationError", "PermissionDeniedError")
 _RATE_LIMIT_ERRORS = _named_errors("RateLimitError")
+_SERVER_ERRORS = _named_errors("InternalServerError", "ServiceUnavailableError")
 
-# 优先级：鉴权 > 限流 > 网络。因为 RateLimitError 在这版 SDK 里是
-# APIConnectionError 的子类，顺序反了会把限流误判成硬故障。
+# 优先级：鉴权 > 限流 > 网络 > status_code 兜底。限流必须排在按 status_code 分类之前，
+# 否则 429 会被当成普通 4xx 客户端错误、误判成硬故障。
+# （本地内省 openai 3.31.0 确认：RateLimitError -> APIStatusError -> APIError，带 status_code=429）
 _FATAL_KINDS = "、".join(e.__name__ for e in _AUTH_ERRORS) or "AuthError"
 _TRANSIENT_KINDS = "、".join(
-    e.__name__ for e in (*_RATE_LIMIT_ERRORS, *_NETWORK_ERRORS)
+    e.__name__ for e in (*_RATE_LIMIT_ERRORS, *_NETWORK_ERRORS, *_SERVER_ERRORS)
 ) or "NetworkError"
 
-# 限流归为「可重试」的理由：RateLimitError 是服务端过载/配额瞬时打满，
-# 不是配置错误——重试 1 次 + 稍后重跑就能恢复；而 401 (AuthenticationError)
-# 重试多少次都一样，必须立刻暴露。
-_TEMPORARY_MARKERS = ("rate limit", "429", "overloaded", "timeout", "timed out")
+# 可重试：限流、5xx（InternalServerError 等）都是服务端过载/瞬时故障，等一会儿
+# 重试 1 次即可恢复；APITimeoutError 同理——读超时多为服务端排队或网络抖动，
+# 不是配置错误，重试代价低于直接降级（且本版 SDK 里它继承 APIConnectionError）。
+# 不可重试：401/403（鉴权）与其它 4xx——请求本身有问题，重试多少次都一样，必须立刻暴露。
+_TEMPORARY_MARKERS = (
+    "rate limit", "429", "overloaded", "timeout", "timed out",
+    "internal server error", "bad gateway", "service unavailable",
+)
 _PERMANENT_MARKERS = ("401", "403", "invalid api key", "authentication", "unauthorized")
 
 
@@ -58,6 +64,14 @@ def classify_openai_error(exc: BaseException) -> "LLMTransientError | LLMFatalEr
         if any(m in text for m in _PERMANENT_MARKERS):
             return LLMFatalError(f"网络/鉴权类硬故障（不可重试）: {type(exc).__name__}")
         return LLMTransientError(f"网络异常（可重试）: {type(exc).__name__}")
+    # 5xx：服务端瞬时故障（InternalServerError 及未被 SDK 具名类覆盖的 5xx 状态）
+    if _SERVER_ERRORS and isinstance(exc, _SERVER_ERRORS):
+        return LLMTransientError(f"服务端 5xx（可重试）: {type(exc).__name__}")
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and 500 <= status < 600:
+        return LLMTransientError(f"服务端 {status}（可重试）: {type(exc).__name__}")
+    if isinstance(status, int) and 400 <= status < 500:
+        return LLMFatalError(f"客户端 {status}（不可重试）: {type(exc).__name__}")
     text = str(exc).lower()
     if any(m in text for m in _TEMPORARY_MARKERS):
         return LLMTransientError(f"临时性错误（可重试）: {type(exc).__name__}")
