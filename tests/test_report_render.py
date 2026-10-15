@@ -10,6 +10,7 @@ AGENT_LABELS = {
     "industry_analyst": "行业",
     "sentiment_analyst": "舆情",
     "technical_analyst": "技术面",
+    "valuation_analyst": "估值",
 }
 
 
@@ -30,6 +31,7 @@ def analyses_all():
         "industry_analyst": analysis("industry_analyst", "中性"),
         "sentiment_analyst": analysis("sentiment_analyst", "减持"),
         "technical_analyst": analysis("technical_analyst", "增持", "低", assumptions=[]),
+        "valuation_analyst": analysis("valuation_analyst", "减持"),
     }
 
 
@@ -73,9 +75,9 @@ def test_render_contains_all_sections():
 def test_render_keeps_agent_divergence():
     text = render_report(state_without_report())
 
-    # 四家结论分歧必须逐家呈现，不许只留综合结论
+    # 五家结论分歧必须逐家呈现，不许只留综合结论
     assert "增持" in text and "中性" in text and "减持" in text
-    assert text.count("### ") == 4
+    assert text.count("### ") == 5
 
 
 def test_render_empty_challenges_still_discloses_sources_and_assumptions():
@@ -155,3 +157,24 @@ def test_write_report_creates_file(tmp_path):
 def test_write_report_unknown_ticker_falls_back():
     path = report_path({"query": "没有代码的查询"})
     assert path.name.startswith("unknown_")
+
+
+def test_render_covers_every_known_agent():
+    """防漂移：KNOWN_AGENTS 扩容后报告必须逐家给章节（估值 Agent 曾整段漏掉）。
+
+    教训来自第十步冒烟：五分析师跑通、报告却只列四家——因为 render 的
+    AGENT_ORDER / AGENT_LABELS 是各自维护的常量。这里以 KNOWN_AGENTS 为准绳断言。
+    """
+    from src.graph.nodes import KNOWN_AGENTS
+    from src.report.render import AGENT_LABELS as RENDER_LABELS
+    from src.report.render import AGENT_ORDER
+
+    assert set(AGENT_ORDER) == set(KNOWN_AGENTS)
+    assert set(RENDER_LABELS) == set(KNOWN_AGENTS)
+
+    analyses = {name: analysis(name) for name in KNOWN_AGENTS}
+    text = render_report(state_without_report(analyses=analyses))
+
+    assert text.count("### ") == len(KNOWN_AGENTS)
+    for name in KNOWN_AGENTS:
+        assert f"### {RENDER_LABELS[name]}（{name}）" in text

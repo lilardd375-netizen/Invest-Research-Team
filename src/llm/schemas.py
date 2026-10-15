@@ -26,9 +26,9 @@ class KeyPoint(BaseModel):
 
 
 class AnalysisBase(BaseModel):
-    """四个分析师 Agent 的公共输出结构。
+    """分析师 Agent 的公共输出结构（第十步起为五家）。
 
-    conclusion 三档跨 Agent 统一，是为了第八步报告合成时能把四家结论聚合比较；
+    conclusion 三档跨 Agent 统一，是为了第八步报告合成时能把各家结论聚合比较；
     各子类只固定 agent 字段，不得改变其余字段的语义。
     """
 
@@ -63,6 +63,16 @@ class TechnicalAnalysisModel(AnalysisBase):
     agent: Literal["technical_analyst"] = "technical_analyst"
 
 
+class ValuationAnalysisModel(AnalysisBase):
+    """估值分析 Agent 的输出结构（PE/PB 当前值与历史分位、行业静态 PE 对照）。
+
+    数据源只给计算事实（当前值 / 窗口 / 样本数 / 分位数 / 行业对照），
+    「贵 / 便宜」的定性判断由本 Agent 基于这些事实给出，不允许引入外部结论。
+    """
+
+    agent: Literal["valuation_analyst"] = "valuation_analyst"
+
+
 class Challenge(BaseModel):
     """风控对某个 Agent 输出的一条具体质询。"""
 
@@ -92,7 +102,7 @@ class RiskReviewModel(BaseModel):
 class AgentSummary(BaseModel):
     """报告里对单个分析师的逐家呈现。
 
-    特意做成 list 而不是「四家合成一句话」：分歧本身是研究结论的一部分，
+    特意做成 list 而不是「各家合成一句话」：分歧本身是研究结论的一部分，
     谁看多谁看空必须留在报告里，不允许被综合结论吞掉。
     """
 
@@ -123,9 +133,9 @@ class ReportModel(BaseModel):
     """报告合成 Agent 的输出结构（第八步）。
 
     约束：
-    - per_agent_summaries 必须逐家呈现（四家都出现），不许只给综合结论；
+    - per_agent_summaries 必须逐家呈现（各家都出现），不许只给综合结论；
     - revision_history 与 disclosures 是独立字段，渲染时也会独立成章；
-    - 不得引入四家结论之外的外部评级数据。
+    - 不得引入各家结论之外的外部评级数据。
     """
 
     title: str

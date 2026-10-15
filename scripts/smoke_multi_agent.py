@@ -1,4 +1,4 @@
-"""第七步真实冒烟（两阶段，日志文件友好）：四数据源 + 四分析师并行 + 质询回传。
+"""真实冒烟（两阶段，日志文件友好）：五数据源 + 五分析师并行 + 质询回传（第十步起含估值）。
 
 推荐跑法（分钟级真实冒烟一律写日志文件，避免 tool call 中断丢掉全过程）：
 
@@ -30,10 +30,17 @@ from src.tools.financial_data import AkshareProvider
 from src.tools.industry_data import AkshareIndustryProvider
 from src.tools.sentiment_data import AkshareSentimentProvider
 from src.tools.technical_data import AkshareTechnicalProvider
+from src.tools.valuation_data import AkshareValuationProvider
 
 TICKER = "300750"
 QUERY = "宁德时代 300750 的投资价值"
-AGENTS = ("financial_analyst", "industry_analyst", "sentiment_analyst", "technical_analyst")
+AGENTS = (
+    "financial_analyst",
+    "industry_analyst",
+    "sentiment_analyst",
+    "technical_analyst",
+    "valuation_analyst",
+)
 DEFAULT_SNAPSHOT = "_smoke7_snapshot.json"
 START = time.time()
 OUTPUT: list[str] = []
@@ -87,6 +94,9 @@ class SnapshotProvider:
         return self._fetch(ticker)
 
     def get_technical(self, ticker: str) -> dict:
+        return self._fetch(ticker)
+
+    def get_valuation(self, ticker: str) -> dict:
         return self._fetch(ticker)
 
 
@@ -145,9 +155,39 @@ def _summarize_technical(data: dict) -> list[str]:
     ]
 
 
+def _summarize_valuation(data: dict) -> list[str]:
+    window = data.get("window") or {}
+    metrics = data.get("metrics") or {}
+    pe = metrics.get("pe_ttm") or {}
+    pb = metrics.get("pb") or {}
+    industry = data.get("industry") or {}
+    return [
+        f"窗口 {window.get('label')} {window.get('start')} ~ {window.get('end')} / {window.get('trading_days')} 个交易日",
+        "PE(TTM) 当前={current} 分位={percentile}% 区间 {low}~{high} 中位={median} 样本={samples}".format(
+            current=pe.get("current"),
+            percentile=pe.get("percentile"),
+            low=pe.get("min"),
+            high=pe.get("max"),
+            median=pe.get("median"),
+            samples=pe.get("samples"),
+        ),
+        "PB 当前={current} 分位={percentile}% 区间 {low}~{high} 中位={median} 样本={samples}".format(
+            current=pb.get("current"),
+            percentile=pb.get("percentile"),
+            low=pb.get("min"),
+            high=pb.get("max"),
+            median=pb.get("median"),
+            samples=pb.get("samples"),
+        ),
+        f"行业对照 {industry.get('name')}({industry.get('code')}) 静态PE加权={industry.get('pe_static_weighted')} "
+        f"中位={industry.get('pe_static_median')} 家数={industry.get('companies')}",
+        f"missing_fields={data.get('missing_fields')}",
+    ]
+
+
 def read_snapshot(path: Path) -> dict:
     if not path.is_file():
-        emit(f"[!] 快照文件不存在：{path}（阶段二四个数据源都会降级 unavailable）")
+        emit(f"[!] 快照文件不存在：{path}（阶段二五个数据源都会降级 unavailable）")
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -168,12 +208,13 @@ def write_snapshot(path: Path, payload: dict) -> None:
 
 def stage1(snapshot_path: Path) -> dict:
     emit("=" * 78)
-    emit("[阶段一] 四个数据源真实取数（不调 LLM）")
+    emit("[阶段一] 五个数据源真实取数（不调 LLM）")
     sources = [
         ("financial", AkshareProvider(), "get_financials", _summarize_financial),
         ("industry", AkshareIndustryProvider(), "get_industry", _summarize_industry),
         ("sentiment", AkshareSentimentProvider(), "get_sentiment", _summarize_sentiment),
         ("technical", AkshareTechnicalProvider(), "get_technical", _summarize_technical),
+        ("valuation", AkshareValuationProvider(), "get_valuation", _summarize_valuation),
     ]
     results: dict[str, dict] = {}
     for label, provider, method, summarize in sources:
@@ -189,9 +230,9 @@ def stage1(snapshot_path: Path) -> dict:
         emit(f"{label} 退出：[OK] 耗时 {time.time() - started:.1f}s / JSON {size} 字符")
         for line in summarize(data):
             emit(f"     {line}")
-    emit(f"阶段一小结：成功 {len(results)}/4 -> {sorted(results)}")
+    emit(f"阶段一小结：成功 {len(results)}/5 -> {sorted(results)}")
     write_snapshot(snapshot_path, {**results, "_fetched_at": datetime.now().isoformat(timespec="seconds")})
-    emit(f"SMOKE STAGE1 DONE 成功 {len(results)}/4")
+    emit(f"SMOKE STAGE1 DONE 成功 {len(results)}/5")
     return results
 
 
@@ -205,7 +246,7 @@ def _progress_tracker():
             seen["outline"] = True
             sections = (snapshot.get("outline") or {}).get("sections") or []
             emit(f"planner 退出：{len(sections)} 个板块")
-            emit("进入四分析师 fan-out（financial / industry / sentiment / technical）")
+            emit("进入五分析师 fan-out（financial / industry / sentiment / technical / valuation）")
         for agent in AGENTS:
             if agent in analyses and agent not in seen["analysts"]:
                 seen["analysts"].add(agent)
@@ -214,7 +255,7 @@ def _progress_tracker():
                 emit(f"{agent} 进入→退出：{state}")
         if not seen["all_analysts"] and len(seen["analysts"]) == len(AGENTS):
             seen["all_analysts"] = True
-            emit("四分析师 退出：全部完成（fan-in 到 risk_review）")
+            emit("五分析师 退出：全部完成（fan-in 到 risk_review）")
         review = snapshot.get("risk_review")
         if review and review != seen["review"]:
             seen["review"] = review
@@ -230,7 +271,7 @@ def _progress_tracker():
         if round_now > seen["round"]:
             seen["round"] = round_now
             emit(f"revise 退出：已分发质询，进入第 {round_now} 轮返工")
-            emit(f"进入四分析师 fan-out（第 {round_now} 轮）")
+            emit(f"进入五分析师 fan-out（第 {round_now} 轮）")
         if snapshot.get("final_report") and not seen["done"]:
             seen["done"] = True
             emit("finalize 退出")
@@ -252,6 +293,7 @@ def stage2(snapshot: dict) -> int:
         "industry_provider": SnapshotProvider(snapshot.get("industry"), "industry"),
         "sentiment_provider": SnapshotProvider(snapshot.get("sentiment"), "sentiment"),
         "technical_provider": SnapshotProvider(snapshot.get("technical"), "technical"),
+        "valuation_provider": SnapshotProvider(snapshot.get("valuation"), "valuation"),
     }
 
     app = build_graph(
@@ -260,6 +302,7 @@ def stage2(snapshot: dict) -> int:
         industry_llm=llms["industry_analyst"],
         sentiment_llm=llms["sentiment_analyst"],
         technical_llm=llms["technical_analyst"],
+        valuation_llm=llms["valuation_analyst"],
         risk_llm=risk_llm,
         **providers,
     )
@@ -302,7 +345,7 @@ def stage2(snapshot: dict) -> int:
                 emit(f"    {_agent_line(agent, payload)}")
 
     analyses = final.get("analyses") or {}
-    emit("[3] 最终四分析师结果：")
+    emit("[3] 最终五分析师结果：")
     for agent in AGENTS:
         payload = analyses.get(agent)
         emit(f"    {_agent_line(agent, payload) if payload else f'{agent}: 无结果'}")

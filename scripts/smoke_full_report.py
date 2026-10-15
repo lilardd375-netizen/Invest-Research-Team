@@ -22,7 +22,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 DEFAULT_SNAPSHOT = ROOT / "_smoke7_snapshot.json"
-AGENTS = ("financial_analyst", "industry_analyst", "sentiment_analyst", "technical_analyst")
+AGENTS = (
+    "financial_analyst",
+    "industry_analyst",
+    "sentiment_analyst",
+    "technical_analyst",
+    "valuation_analyst",
+)
 START = time.time()
 
 sys.path.insert(0, str(ROOT))
@@ -59,6 +65,7 @@ def stage2_report(smoke, snapshot: dict) -> int:
         "industry_provider": smoke.SnapshotProvider(snapshot.get("industry"), "industry"),
         "sentiment_provider": smoke.SnapshotProvider(snapshot.get("sentiment"), "sentiment"),
         "technical_provider": smoke.SnapshotProvider(snapshot.get("technical"), "technical"),
+        "valuation_provider": smoke.SnapshotProvider(snapshot.get("valuation"), "valuation"),
     }
 
     app = build_graph(
@@ -67,6 +74,7 @@ def stage2_report(smoke, snapshot: dict) -> int:
         industry_llm=llms["industry_analyst"],
         sentiment_llm=llms["sentiment_analyst"],
         technical_llm=llms["technical_analyst"],
+        valuation_llm=llms["valuation_analyst"],
         risk_llm=risk_llm,
         report_llm=report_llm,
         **providers,
@@ -116,7 +124,7 @@ def stage2_report(smoke, snapshot: dict) -> int:
             if payload:
                 emit(f"      {smoke._agent_line(agent, payload)}")
 
-    emit("[3] 最终四分析师结果：")
+    emit("[3] 最终五分析师结果：")
     for agent in AGENTS:
         payload = (final.get("analyses") or {}).get(agent)
         emit(f"    {smoke._agent_line(agent, payload) if payload else f'{agent}: 无结果'}")

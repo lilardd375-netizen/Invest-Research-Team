@@ -1,7 +1,7 @@
 """按 LangGraph API 组装图：
-planner -> 四个分析师并行（fan-out）-> risk_review -> 条件路由 -> revise/finalize，
-其中 revise 不回到风控，而是回到四个分析师（带质询重跑），形成
-risk_review --revise--> revise -> 四分析师 -> risk_review 的返工环。
+planner -> 五个分析师并行（fan-out）-> risk_review -> 条件路由 -> revise/finalize，
+其中 revise 不回到风控，而是回到五个分析师（带质询重跑），形成
+risk_review --revise--> revise -> 五分析师 -> risk_review 的返工环。
 """
 
 from langgraph.graph import END, StateGraph
@@ -17,6 +17,7 @@ from src.graph.nodes import (
     make_risk_review_node,
     make_sentiment_analyst_node,
     make_technical_analyst_node,
+    make_valuation_analyst_node,
     planner_node,
     revise_node,
     risk_review_node,
@@ -31,6 +32,7 @@ ANALYST_NODES = (
     "industry_analyst",
     "sentiment_analyst",
     "technical_analyst",
+    "valuation_analyst",
 )
 
 
@@ -55,20 +57,22 @@ def build_graph(
     industry_llm=None,
     sentiment_llm=None,
     technical_llm=None,
+    valuation_llm=None,
     risk_llm=None,
     report_llm=None,
     financial_provider=None,
     industry_provider=None,
     sentiment_provider=None,
     technical_provider=None,
+    valuation_provider=None,
     data_provider=None,
 ):
     """组装并 compile 返回。全部参数 None 默认，不传 = 全占位图（向后兼容）。
 
     - planner_llm 为 None 时 planner 用占位节点。
     - financial_llm 或财务数据源为 None 时财务分析用占位节点，返回空 analyses（旧行为不变）。
-    - industry_llm / sentiment_llm / technical_llm 为 None（或对应数据源为 None）时，
-      该节点整体 skip：不写 analyses、不调 LLM。
+    - industry_llm / sentiment_llm / technical_llm / valuation_llm 为 None（或对应数据源
+      为 None）时，该节点整体 skip：不写 analyses、不调 LLM。
     - risk_llm 为 None 时风控用占位节点（原样回显 severity）；传入时风控由真实 LLM
       评审，其 severity 真实驱动 revise/finalize 路由。
     - report_llm 为 None 时 finalize 走规则式组装（不调 LLM，仍产出完整 Markdown
@@ -86,7 +90,7 @@ def build_graph(
         financial_fn = make_financial_analyst_node(financial_llm, financial_provider)
 
     def _domain_fn(llm, provider, factory):
-        """三个新 Agent 的通用装配：缺 LLM 或缺数据源 -> 整节点 skip。"""
+        """新 Agent（行业/舆情/技术面/估值）的通用装配：缺 LLM 或缺数据源 -> 整节点 skip。"""
         if llm is None or provider is None:
             return _missing_domain_analyst_stub_node
         return factory(llm, provider)
@@ -108,21 +112,25 @@ def build_graph(
         "technical_analyst",
         _domain_fn(technical_llm, technical_provider, make_technical_analyst_node),
     )
+    graph.add_node(
+        "valuation_analyst",
+        _domain_fn(valuation_llm, valuation_provider, make_valuation_analyst_node),
+    )
     graph.add_node("risk_review", risk_fn)
     graph.add_node("revise", revise_node)
     graph.add_node("finalize", report_fn)
 
     graph.set_entry_point("planner")
     for name in ANALYST_NODES:
-        graph.add_edge("planner", name)  # fan-out：四个分析师并行
-        graph.add_edge(name, "risk_review")  # fan-in：等四个都完成再评审
+        graph.add_edge("planner", name)  # fan-out：五个分析师并行
+        graph.add_edge(name, "risk_review")  # fan-in：等五个都完成再评审
     graph.add_conditional_edges(
         "risk_review",  # 从哪个节点出发
         route_after_review,  # 路由函数：fn(state) -> 返回分支名
         {"revise": "revise", "finalize": "finalize"},  # 分支名->目标节点
     )
     for name in ANALYST_NODES:
-        graph.add_edge("revise", name)  # 返工回环：带质询 fan-out 给四个分析师
+        graph.add_edge("revise", name)  # 返工回环：带质询 fan-out 给五个分析师
     graph.add_edge("finalize", END)
     return graph.compile()
 

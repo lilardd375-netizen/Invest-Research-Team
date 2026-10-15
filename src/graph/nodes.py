@@ -15,6 +15,7 @@ from src.llm.schemas import (
     RiskReviewModel,
     SentimentAnalysisModel,
     TechnicalAnalysisModel,
+    ValuationAnalysisModel,
 )
 from src.report.render import build_rule_based_report, render_report
 from src.tools.utils import normalize_ticker
@@ -27,6 +28,7 @@ PLANNER_SYSTEM_PROMPT = """你是一名资深投资研究主编，负责为个�
 2. 每个章节给出 2-4 个具体、可查证的研究问题。
 3. 研究问题要落到可验证的事实上（营收结构、产能、客户集中度、
    竞争格局、政策风险、估值区间等），不要空泛。
+4. 必须包含一个估值维度章节（估值水平、历史分位、行业对照）。
 
 只输出 JSON，不要其他文字。JSON 结构必须是：
 {
@@ -150,8 +152,8 @@ RISK_REVIEW_SYSTEM_PROMPT = """你是投资研究团队里的反方辩手（风�
 - medium = 假设偏激进但可接受，报告中披露即可；
 - low    = 常规提示，并入风险章节即可。
 
-任务边界（已知，不是缺陷）：当前已实现的分析师为 financial / industry / sentiment / technical 四个。
-估值、宏观、政策等维度暂无数据源是已知的任务边界：可以在 challenges 或 summary 里
+任务边界（已知，不是缺陷）：当前已实现的分析师为 financial / industry / sentiment / technical / valuation 五个。
+宏观、政策等维度暂无数据源是已知的任务边界：可以在 challenges 或 summary 里
 提示覆盖缺口，但不应仅因覆盖不足就把 severity 判为 high。
 severity=high 只用于：存在数据错误、口径错误、或已覆盖维度的逻辑漏洞。
 
@@ -184,7 +186,7 @@ MAX_CHALLENGES_IN_DIGEST = 8
 
 # 送进风控 prompt 的 analyses JSON 体量上限：超过就瘦身（每 Agent 只保留
 # conclusion / confidence / key_points 前 N 条 / status 等关键字段），
-# 避免四个 Agent 全量输出把 prompt 撑爆。
+# 避免多 Agent 全量输出把 prompt 撑爆。
 MAX_ANALYSES_JSON_CHARS = 6000
 MAX_KEY_POINTS_IN_DIGEST = 4
 
@@ -196,19 +198,19 @@ CHALLENGE_TEXT_CHARS = 200
 REPORT_SUMMARY_FALLBACK = "（合成 LLM 未逐家呈现，此处按原始分析结果补齐）"
 
 # 报告合成 Agent 的 system prompt（模块级常量，中文）。
-REPORT_SYSTEM_PROMPT = """你是投资研究团队的报告主编，负责把四个分析师的结论、风控的多轮质询与返工记录，合成一份诚实的机构研究报告 JSON。
+REPORT_SYSTEM_PROMPT = """你是投资研究团队的报告主编，负责把五个分析师的结论、风控的多轮质询与返工记录，合成一份诚实的机构研究报告 JSON。
 
 硬性要求：
-1. 逐家呈现：per_agent_summaries 必须覆盖输入里出现的每一个分析师（财务/行业/舆情/技术面），
+1. 逐家呈现：per_agent_summaries 必须覆盖输入里出现的每一个分析师（财务/行业/舆情/技术面/估值），
    哪怕结论互相矛盾也要保留分歧，绝对不许只给一句「综合结论」把分歧吞掉。
    status 为 unavailable 的分析师也要列出，conclusion 留空、summary 说明其不可用原因。
-2. 综合结论只能来自四家已有结论（多数且过半才给方向，票数分散就给「中性」），
+2. 综合结论只能来自各家已有结论（多数且过半才给方向，票数分散就给「中性」），
    不许引入任何外部评级数据。
 3. key_thesis 给 3-5 条支撑逻辑，key_risks 给主要风险（含风控质询里未解决的问题）。
 4. revision_history 必须照抄输入的每一轮：round / severity / degraded / challenge_targets /
    revised_agents，degraded=true 的轮次要保留该标记，不许抹平成正常评审。
 5. disclosures 必须收编：全部 medium 质询、数据源或 LLM 降级情况、风控降级轮次、
-   假设与局限（覆盖边界：只有财务/行业/舆情/技术面四个维度，估值/宏观/政策无数据源）。
+   假设与局限（覆盖边界：只有财务/行业/舆情/技术面/估值五个维度，宏观/政策无数据源）。
 6. 只输出 JSON，不要任何其他文字。
 
 输出 JSON 结构：
@@ -231,12 +233,41 @@ REPORT_SYSTEM_PROMPT = """你是投资研究团队的报告主编，负责把四
   "generated_at": "ISO 时间"
 }"""
 
+# 估值分析 Agent 的 system prompt（模块级常量，中文）。
+VALUATION_ANALYST_SYSTEM_PROMPT = """你是一名估值分析 Agent，服务于投资研究团队。
+
+你会收到某标的的估值数据：PE(TTM) 与市净率的近三年日频序列（当前值、区间、中位数、
+历史分位数、样本数、窗口起止），以及所属行业的静态市盈率对照。要求：
+
+1. 只依据给定数据下结论，禁止编造缺失的数据；数据缺失就写进 assumptions 或 concerns。
+2. key_points 每条必须标注 data_source，写清引用的是哪个字段，且 finding 里带上具体数值
+   （例如 "PE(TTM) 15.16，近三年分位 2.19%（样本 1097 日）"）。
+3. 必须引用历史分位数与样本数，不要只给一个孤立的估值乘数；分位数定义是
+   "窗口内取值 ≤ 当前值的样本占比"，越高表示当前估值在窗口内越高。
+4. 行业对照是静态市盈率(LYR)口径、个股是 PE(TTM) 口径，口径不同，只能作量级对照，
+   引用时必须说明该差异，不得直接相减或相除后当成同一口径。
+5. conclusion 三档表示估值维度对持仓的含义：估值处于历史区间下部且基本面未见恶化给 增持，
+   处于历史区间中部或口径不可比给 中性，处于历史高位或盈利下滑导致 PE 被动抬升给 减持。
+6. confidence 只能是 高 / 中 / 低；样本越短、窗口越窄、行业对照缺失就越低。
+7. 不允许引入外部评级、目标价或市场一致预期；"贵 / 便宜"的定性必须能由上面这些数字复现。
+
+只输出 JSON，不要其他文字。JSON 结构必须是：
+{
+  "agent": "valuation_analyst",
+  "conclusion": "增持|中性|减持",
+  "confidence": "高|中|低",
+  "key_points": [{"finding": "...", "data_source": "..."}],
+  "concerns": ["..."],
+  "assumptions": ["..."]
+}"""
+
 # 已实现的分析师（revise 只把质询分发给它们，其余归 unassigned）。
 KNOWN_AGENTS = (
     "financial_analyst",
     "industry_analyst",
     "sentiment_analyst",
     "technical_analyst",
+    "valuation_analyst",
 )
 
 _TICKER_RE = re.compile(r"\d{6}")
@@ -550,6 +581,19 @@ def make_technical_analyst_node(llm, data_provider):
         system_prompt=TECHNICAL_ANALYST_SYSTEM_PROMPT,
         data_label="日线技术指标（均线 / 区间涨跌与高低点 / 量比）",
         fetch=lambda provider, ticker: provider.get_technical(ticker),
+    )
+
+
+def make_valuation_analyst_node(llm, data_provider):
+    """估值分析节点工厂：llm.chat + ValuationProvider（PE/PB 历史分位 + 行业静态 PE 对照）。"""
+    return _make_domain_analyst_node(
+        llm,
+        data_provider,
+        agent="valuation_analyst",
+        model_cls=ValuationAnalysisModel,
+        system_prompt=VALUATION_ANALYST_SYSTEM_PROMPT,
+        data_label="估值数据（PE(TTM)/PB 近三年序列 + 历史分位 + 行业静态 PE 对照）",
+        fetch=lambda provider, ticker: provider.get_valuation(ticker),
     )
 
 
@@ -888,12 +932,12 @@ def _review_history_digest(state: dict) -> str:
 
 
 def _build_report_user_prompt(state: dict) -> str:
-    """组装报告合成的 user prompt：四家输出 + 全部质询 + 逐轮 severity/返工记录。"""
+    """组装报告合成的 user prompt：各家输出 + 全部质询 + 逐轮 severity/返工记录。"""
     ticker = extract_ticker(state.get("query", ""))
     return (
         f"当前系统日期：{date.today().isoformat()}。\n\n"
         f"研究标的：{state.get('query', '')}（股票代码：{ticker}）\n\n"
-        "== 四个分析师的输出（JSON，含 unavailable/error）==\n"
+        "== 五个分析师的输出（JSON，含 unavailable/error）==\n"
         f"{_analyses_digest(state.get('analyses'))}\n\n"
         "== 研究大纲概要 ==\n"
         f"{_outline_digest(state.get('outline'))}\n\n"
@@ -960,7 +1004,7 @@ def make_finalize_node(llm):
     """成稿节点工厂：注入 report_llm，合成 ReportModel 并渲染 Markdown。
 
     失败兜底：LLM 不可用 / 校验失败 -> build_rule_based_report 规则式组装，
-    写 report_llm_degraded=True —— 合成失败绝不允许丢掉四个分析师和两轮返工的结果。
+    写 report_llm_degraded=True —— 合成失败绝不允许丢掉各分析师和两轮返工的结果。
     """
 
     def finalize_node_with_llm(state: dict) -> dict:

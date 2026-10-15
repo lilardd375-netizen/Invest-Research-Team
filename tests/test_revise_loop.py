@@ -68,12 +68,13 @@ RISK_LOW = risk_json("low", [], "质询已回应，风险可控")
 COVERAGE_ONLY_HIGH = risk_json(
     "high",
     [
-        # 第七步起 industry_analyst 已是已知分析师，这里改用仍未实现的估值维度
-        # 来验证「未知 target 归 unassigned 不丢失」的语义（测试意图不变）。
+        # 第七步起 industry_analyst 已是已知分析师；第十步起 valuation_analyst 也已上线，
+        # 故改用仍未实现的宏观维度来验证「未知 target 归 unassigned 不丢失」的语义
+        # （测试意图不变：未知 target 既不吞掉也不误投给已知分析师）。
         {
-            "target_agent": "valuation_analyst",
-            "issue": "估值维度没有数据源，覆盖不足",
-            "required_action": "补充估值分析",
+            "target_agent": "macro_analyst",
+            "issue": "宏观与政策维度没有数据源，覆盖不足",
+            "required_action": "补充宏观政策分析",
         }
     ],
     "覆盖不足，无法采信",
@@ -163,7 +164,7 @@ def test_unknown_target_preserved():
 
     pending = result["pending_challenges"]
     assert "unassigned" in pending, "未知 target 不能丢"
-    assert pending["unassigned"][0]["target_agent"] == "valuation_analyst"
+    assert pending["unassigned"][0]["target_agent"] == "macro_analyst"
     assert pending["unassigned"][0]["issue"]  # 内容完整保留
     # 收尾后财务 Agent 也带幂等跳过：质询没派给自己，所以本轮直接空转，不再有第 2 次调用
     # （此前预期是 2，属过时预期：那时只有三个新 Agent 有跳过逻辑）

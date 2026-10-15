@@ -22,10 +22,11 @@ import pandas as pd
 import pytest
 
 from src.graph.builder import build_graph
-from src.tools import industry_data, utils
+from src.tools import industry_data, utils, valuation_data
 from src.tools.industry_data import AkshareIndustryProvider, _pick_industry, _secucode
 from src.tools.sentiment_data import AkshareSentimentProvider
 from src.tools.technical_data import AkshareTechnicalProvider
+from src.tools.valuation_data import AkshareValuationProvider, _describe
 
 
 def _fake_akshare(monkeypatch, **attrs):
@@ -505,4 +506,153 @@ def test_ensure_ascii_ca_copies_when_path_not_ascii(tmp_path, monkeypatch):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+# --------------------------------------------------------------------------- 估值数据源（第十步）
+
+
+def _valuation_frame(count=150, base=10.0, step=0.1):
+    days = pd.date_range("2026-01-01", periods=count, freq="D")
+    rows = [(day.strftime("%Y-%m-%d"), base + index * step) for index, day in enumerate(days)]
+    return pd.DataFrame(rows, columns=["date", "value"])
+
+
+def _industry_pe_frame(name="电气机械和器材制造业"):
+    return pd.DataFrame(
+        [
+            {
+                "行业名称": "计算机、通信和其他电子设备制造业",
+                "行业编码": "C39",
+                "行业分类": "证监会行业分类",
+                "变动日期": "2026-10-10",
+                "公司数量": 700,
+                "纳入计算公司数量": 650,
+                "静态市盈率-加权平均": 40.0,
+                "静态市盈率-中位数": 45.0,
+                "静态市盈率-算术平均": 50.0,
+            },
+            {
+                "行业名称": name,
+                "行业编码": "C38",
+                "行业分类": "证监会行业分类",
+                "变动日期": "2026-10-10",
+                "公司数量": 361,
+                "纳入计算公司数量": 276,
+                "静态市盈率-加权平均": 20.39,
+                "静态市盈率-中位数": 38.22,
+                "静态市盈率-算术平均": 84.18,
+            },
+        ]
+    )
+
+
+def test_valuation_full_path_with_stubbed_akshare(monkeypatch):
+    """PE/PB 序列 -> 当前值/区间/中位数/分位数/样本数，外加行业静态 PE 对照。"""
+    requested: list[str] = []
+
+    def _baidu(symbol, indicator, period):
+        requested.append(indicator)
+        assert symbol == "300750"
+        assert period == valuation_data.PERIOD
+        return _valuation_frame()
+
+    _fake_akshare(
+        monkeypatch,
+        stock_zh_valuation_baidu=_baidu,
+        stock_profile_cninfo=lambda symbol: pd.DataFrame([{"所属行业": "电气机械和器材制造业"}]),
+        stock_industry_pe_ratio_cninfo=lambda symbol, date: _industry_pe_frame(),
+    )
+
+    result = AkshareValuationProvider().get_valuation("300750")
+
+    assert requested == [valuation_data.PE_INDICATOR, valuation_data.PB_INDICATOR]
+    assert result["window"]["label"] == "近三年"
+    assert result["window"]["trading_days"] == 150
+    assert "分位数" in result["window"]["definition"]
+    pe = result["metrics"]["pe_ttm"]
+    assert pe["samples"] == 150
+    assert pe["current"] == round(10.0 + 149 * 0.1, 4)
+    assert pe["min"] == 10.0
+    assert pe["percentile"] == 100.0  # 序列递增 -> 当前值即窗口最大值
+    assert result["industry"]["name"] == "电气机械和器材制造业"
+    assert result["industry"]["code"] == "C38"
+    assert result["industry"]["pe_static_weighted"] == 20.39
+    assert result["industry"]["companies_in_calc"] == 276
+    assert "口径不同" in result["industry_caliber_note"]
+    assert result["missing_fields"] == []
+
+
+def test_valuation_industry_missing_is_flagged(monkeypatch):
+    """行业对照取数失败不应让估值序列作废，只写进 missing_fields。
+
+    两种粒度分开记录：行业名取不到 -> industry_name；行业名拿到但行业 PE 表失败
+    -> industry（附 industry_last_error）。这条区分让风控能看出缺的是哪一层。
+    """
+    monkeypatch.setattr(utils.time, "sleep", lambda _seconds: None)
+
+    def _boom(symbol):
+        raise RuntimeError("profile 接口不可用")
+
+    _fake_akshare(
+        monkeypatch,
+        stock_zh_valuation_baidu=lambda symbol, indicator, period: _valuation_frame(),
+        stock_profile_cninfo=_boom,
+    )
+
+    result = AkshareValuationProvider().get_valuation("300750")
+
+    assert result["industry"] is None
+    assert result["metrics"]["pe_ttm"]["samples"] == 150
+    assert result["missing_fields"] == ["industry_name"]
+
+
+def test_valuation_industry_pe_table_failure_is_flagged(monkeypatch):
+    """行业名拿到、行业 PE 表逐日回退仍失败 -> missing 记 industry 与失败类型。"""
+    monkeypatch.setattr(utils.time, "sleep", lambda _seconds: None)
+
+    def _boom(symbol, date):
+        raise RuntimeError("行业市盈率表不可用")
+
+    _fake_akshare(
+        monkeypatch,
+        stock_zh_valuation_baidu=lambda symbol, indicator, period: _valuation_frame(),
+        stock_profile_cninfo=lambda symbol: pd.DataFrame([{"所属行业": "电气机械和器材制造业"}]),
+        stock_industry_pe_ratio_cninfo=_boom,
+    )
+
+    result = AkshareValuationProvider().get_valuation("300750")
+
+    assert result["industry"] is None
+    assert "industry" in result["missing_fields"]
+    assert any(item.startswith("industry_last_error:") for item in result["missing_fields"])
+    assert result["metrics"]["pb"]["samples"] == 150
+
+
+def test_valuation_series_too_short_raises(monkeypatch):
+    _fake_akshare(
+        monkeypatch,
+        stock_zh_valuation_baidu=lambda symbol, indicator, period: _valuation_frame(count=50),
+    )
+
+    with pytest.raises(RuntimeError, match="样本不足"):
+        AkshareValuationProvider().get_valuation("300750")
+
+
+def test_valuation_series_bad_structure_raises(monkeypatch):
+    _fake_akshare(
+        monkeypatch,
+        stock_zh_valuation_baidu=lambda symbol, indicator, period: pd.DataFrame({"foo": [1, 2]}),
+    )
+
+    with pytest.raises(RuntimeError, match="结构不符"):
+        AkshareValuationProvider().get_valuation("300750")
+
+
+def test_valuation_percentile_counts_at_or_below():
+    """分位数 = 窗口内 ≤ 当前值的样本占比（定义可被风控复算）。"""
+    rising = [("2026-01-01", 10.0), ("2026-01-02", 20.0), ("2026-01-03", 30.0)]
+    falling = [("2026-01-01", 30.0), ("2026-01-02", 20.0), ("2026-01-03", 10.0)]
+
+    assert _describe(rising, label="pe", caliber="test")["percentile"] == 100.0
+    assert _describe(falling, label="pe", caliber="test")["percentile"] == round(100 / 3, 2)
 

@@ -1,10 +1,11 @@
-"""第七步：行业 / 舆情 / 技术面三个分析 Agent 的测试（全 Fake，不联网、不 import akshare）。
+"""第七步：行业 / 舆情 / 技术面三个分析 Agent 的测试（全 Fake，不联网、不 import akshare）；
+第十步起扩充为四个域分析师（新增估值 Agent）。
 
 覆盖三层：
-1. 三个新 Agent 各 5 条节点级契约（valid / transient_retry / fatal_no_retry /
+1. 每个域 Agent 各 5 条节点级契约（valid / transient_retry / fatal_no_retry /
    provider_failure / consumes_challenges）；
 2. 幂等跳过守卫（已有结果且无待办 -> 不调 LLM）；
-3. 整图：四分析师并行 fan-out、定向返工只重跑被质询方、
+3. 整图：五分析师并行 fan-out、定向返工只重跑被质询方、
    「high -> 修订 -> 复审降级」的构造式闭环（复刻第六步冒烟口径）。
 """
 
@@ -20,12 +21,14 @@ from src.graph.nodes import (
     make_industry_analyst_node,
     make_sentiment_analyst_node,
     make_technical_analyst_node,
+    make_valuation_analyst_node,
 )
 from src.llm.errors import LLMFatalError, LLMTransientError
 from src.tools.financial_data import FakeProvider as FakeFinancialProvider
 from src.tools.industry_data import FakeIndustryProvider
 from src.tools.sentiment_data import FakeSentimentProvider
 from src.tools.technical_data import FakeTechnicalProvider
+from src.tools.valuation_data import FakeValuationProvider
 
 TICKER = "300750"
 QUERY = "宁德时代 300750 的投资价值"
@@ -139,6 +142,24 @@ FAKE_FINANCIALS = {
     "missing_metrics": ["gross_margin"],
 }
 
+FAKE_VALUATION = {
+    "ticker": TICKER,
+    "source": "fake:valuation",
+    "as_of": "2026-10-15",
+    "window": {
+        "label": "近三年",
+        "start": "2023-10-15",
+        "end": "2026-10-15",
+        "trading_days": 1097,
+    },
+    "metrics": {
+        "pe_ttm": {"current": 15.16, "min": 13.98, "max": 32.04, "median": 21.81, "percentile": 2.19, "samples": 1097},
+        "pb": {"current": 3.4, "min": 3.4, "max": 6.71, "median": 4.64, "percentile": 0.09, "samples": 1097},
+    },
+    "industry": {"name": "电气机械和器材制造业", "code": "C38", "pe_static_weighted": 20.39},
+    "missing_fields": [],
+}
+
 
 @dataclass(frozen=True)
 class AgentCase:
@@ -167,6 +188,14 @@ AGENT_CASES = [
         "get_technical",
         FAKE_TECHNICAL,
         "volume_ratio_5_60",
+    ),
+    AgentCase(
+        "valuation_analyst",
+        make_valuation_analyst_node,
+        FakeValuationProvider,
+        "get_valuation",
+        FAKE_VALUATION,
+        "pe_static_weighted",
     ),
 ]
 
@@ -280,6 +309,8 @@ def test_agent_consumes_challenges(case):
     assert "必须逐条正面回应" in prompt
     assert f"{case.name} 的结论缺证据" in prompt
     assert "补齐关键数据来源" in prompt
+    # 修订硬约束条款（第十步任务 0 核查补断言）：域分析师路径此前只有 financial 有断言
+    assert "禁止仅表态承认而不修正" in prompt
     assert out["analyses"][case.name]["revised_in_round"] == 1
     # 只清自己那一格，别人的待办原样保留
     assert out["pending_challenges"] == {case.name: []}
@@ -307,6 +338,7 @@ def make_providers():
         "industry_analyst": FakeIndustryProvider({TICKER: FAKE_INDUSTRY}),
         "sentiment_analyst": FakeSentimentProvider({TICKER: FAKE_SENTIMENT}),
         "technical_analyst": FakeTechnicalProvider({TICKER: FAKE_TECHNICAL}),
+        "valuation_analyst": FakeValuationProvider({TICKER: FAKE_VALUATION}),
     }
 
 
@@ -354,11 +386,13 @@ def build_multi_graph(llms, providers, risk_llm):
         industry_llm=llms["industry_analyst"],
         sentiment_llm=llms["sentiment_analyst"],
         technical_llm=llms["technical_analyst"],
+        valuation_llm=llms["valuation_analyst"],
         risk_llm=risk_llm,
         financial_provider=providers["financial_analyst"],
         industry_provider=providers["industry_analyst"],
         sentiment_provider=providers["sentiment_analyst"],
         technical_provider=providers["technical_analyst"],
+        valuation_provider=providers["valuation_analyst"],
     )
 
 
@@ -375,6 +409,7 @@ def test_parallel_all_run():
         "industry_analyst",
         "sentiment_analyst",
         "technical_analyst",
+        "valuation_analyst",
     }
     for name, llm in llms.items():
         assert llm.calls == 1, f"{name} 应被调用 1 次"
@@ -402,10 +437,11 @@ def test_targeted_revision():
 
     result = app.invoke(base_state())
 
-    # 只有被点名的行业 Agent 重跑；其余三个靠幂等守卫空转跳过
+    # 只有被点名的行业 Agent 重跑；其余四个靠幂等守卫空转跳过
     assert llms["industry_analyst"].calls == 2
     assert llms["sentiment_analyst"].calls == 1
     assert llms["technical_analyst"].calls == 1
+    assert llms["valuation_analyst"].calls == 1
     # 收尾时财务 Agent 也补上了幂等跳过，所以这轮同样空转（此前预期是 2，属过时预期）
     assert llms["financial_analyst"].calls == 1
 

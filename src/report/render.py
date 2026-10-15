@@ -4,7 +4,7 @@
 1. render_report(state) 只读 state，可离线测试、可重放，不依赖网络与 LLM；
 2. 「返工记录」与「披露与局限」必须独立成章——返工过程与诚实披露是这个项目的
    灵魂，不允许被合进正文冲淡；
-3. 报告合成 LLM 失败时用 build_rule_based_report(state) 兜底（规则式拼接四家
+3. 报告合成 LLM 失败时用 build_rule_based_report(state) 兜底（规则式拼接各家
    结论 + 质询列表），合成失败绝不允许丢掉全流程结果。
 """
 
@@ -22,6 +22,7 @@ AGENT_ORDER = (
     "industry_analyst",
     "sentiment_analyst",
     "technical_analyst",
+    "valuation_analyst",
 )
 DEFAULT_REPORT_DIR = "reports"
 MAX_THESIS = 5
@@ -34,6 +35,7 @@ AGENT_LABELS = {
     "industry_analyst": "行业",
     "sentiment_analyst": "舆情",
     "technical_analyst": "技术面",
+    "valuation_analyst": "估值",
 }
 _SAFE_NAME_RE = re.compile(r"[^0-9A-Za-z._-]")
 
@@ -74,11 +76,11 @@ def _challenge_line(challenge: dict, prefix: str = "") -> str:
 
 
 def build_rule_based_report(state: dict) -> dict:
-    """规则式组装报告（无 LLM）：直接拼接四家结论 + 质询列表。
+    """规则式组装报告（无 LLM）：直接拼接各家结论 + 质询列表。
 
     用在两条降级路径：finalize 未注入 report_llm，或合成 LLM 调用/校验失败。
     这是「宁可朴素也不能丢结果」的兜底——报告可以不加修饰，但不能因为合成
-    Agent 挂了就丢掉四个分析师和两轮返工的全部产出。
+    Agent 挂了就丢掉各分析师和两轮返工的全部产出。
     """
     analyses = _as_dict(state.get("analyses"))
     history = [entry for entry in (state.get("review_history") or []) if isinstance(entry, dict)]
@@ -186,8 +188,8 @@ def build_rule_based_report(state: dict) -> dict:
         )
     disclosures.extend(degradations)
     disclosures.append(
-        "覆盖边界：本项目分析师只覆盖财务 / 行业 / 舆情 / 技术面四个维度，"
-        "估值、宏观、政策维度暂无数据源（已知任务边界）。"
+        "覆盖边界：本项目分析师覆盖财务 / 行业 / 舆情 / 技术面 / 估值五个维度，"
+        "宏观、政策维度暂无数据源（已知任务边界）。"
     )
     disclosures.extend(assumptions)
     vote = _vote(conclusions)
@@ -196,7 +198,7 @@ def build_rule_based_report(state: dict) -> dict:
             f"{value} {conclusions.count(value)} 家" for value in dict.fromkeys(conclusions) if value
         )
         disclosures.append(
-            f"四家结论未形成严格多数（{counts}），综合结论按保守口径取「中性」，"
+            f"各家结论未形成严格多数（{counts}），综合结论按保守口径取「中性」，"
             "真实分歧见「各分析师结论」章节。"
         )
     if state.get("report_llm_degraded"):

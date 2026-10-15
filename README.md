@@ -1,7 +1,7 @@
 # invest-research-team
 
-投资研究 multi-agent 系统（LangGraph 骨架）：主编出大纲 → 四个分析师并行
-（财务 / 行业 / 舆情 / 技术面）→ 风控评审 →（必要时按 `target_agent` 分发质询返工）、
+投资研究 multi-agent 系统（LangGraph 骨架）：主编出大纲 → 五个分析师并行
+（财务 / 行业 / 舆情 / 技术面 / 估值）→ 风控评审 →（必要时按 `target_agent` 分发质询返工）、
 否则直接成稿。
 
 ## 快速开始
@@ -43,47 +43,54 @@ flowchart LR
     A --> B2[industry_analyst<br/>行业分析]
     A --> B3[sentiment_analyst<br/>舆情分析]
     A --> B4[technical_analyst<br/>技术面分析]
+    A --> B5[valuation_analyst<br/>估值分析]
     B1 --> C[risk_review<br/>风控评审]
     B2 --> C
     B3 --> C
     B4 --> C
+    B5 --> C
     C -->|severity=high 且 revision_round &lt; 2 且未卡住| R[revise<br/>按 target_agent 分发质询]
     R --> B1
     R --> B2
     R --> B3
     R --> B4
+    R --> B5
     C -->|否则 / 卡住保险丝触发| D[finalize<br/>成稿]
 ```
 
 | 模块 | 职责 |
 | --- | --- |
 | `src/graph/state.py` | `ResearchState`（TypedDict）+ 字段契约：`analyses` / `pending_challenges` / `analyst_errors` 都是 `Annotated[dict, operator.or_]`（并行节点同时写也不冲突），另有 `planner_error`/`analyst_error`/`risk_error` |
-| `src/graph/nodes.py` | 节点工厂：`make_planner_node(llm)`、`make_financial_analyst_node(llm, data_provider)`、`make_industry_analyst_node` / `make_sentiment_analyst_node` / `make_technical_analyst_node`、`make_risk_review_node(llm)`、`revise_node` |
-| `src/graph/builder.py` | `build_graph(planner_llm, financial_llm, industry_llm, sentiment_llm, technical_llm, risk_llm, financial_provider, industry_provider, sentiment_provider, technical_provider, data_provider=None)`：planner → 四分析师 fan-out → risk_review → 条件路由；未注入依赖的分析师节点整节点 skip |
+| `src/graph/nodes.py` | 节点工厂：`make_planner_node(llm)`、`make_financial_analyst_node(llm, data_provider)`、`make_industry_analyst_node` / `make_sentiment_analyst_node` / `make_technical_analyst_node` / `make_valuation_analyst_node`、`make_risk_review_node(llm)`、`revise_node` |
+| `src/graph/builder.py` | `build_graph(planner_llm, financial_llm, industry_llm, sentiment_llm, technical_llm, valuation_llm, risk_llm, report_llm, financial_provider, industry_provider, sentiment_provider, technical_provider, valuation_provider, data_provider=None)`：planner → 五分析师 fan-out → risk_review → 条件路由；未注入依赖的分析师节点整节点 skip |
 | `src/llm/client.py` | `DeepSeekClient`：只管发请求拿原始 JSON 字符串，不解析；异常分类见下 |
-| `src/llm/schemas.py` | Pydantic 输出契约：`OutlineModel`、`AnalysisBase`（`conclusion`/`confidence`/`key_points`/`concerns`/`assumptions`）+ `FinancialAnalysisModel` / `IndustryAnalysisModel` / `SentimentAnalysisModel` / `TechnicalAnalysisModel`、`RiskReviewModel`（`Challenge`） |
+| `src/llm/schemas.py` | Pydantic 输出契约：`OutlineModel`、`AnalysisBase`（`conclusion`/`confidence`/`key_points`/`concerns`/`assumptions`）+ `FinancialAnalysisModel` / `IndustryAnalysisModel` / `SentimentAnalysisModel` / `TechnicalAnalysisModel` / `ValuationAnalysisModel`、`RiskReviewModel`（`Challenge`） |
 | `src/llm/errors.py` | `LLMTransientError`（可重试）/ `LLMFatalError`（不可重试） |
 | `src/tools/utils.py` | 数据层公共机制：`clean_value`、`period_key`、`pick_latest_row`、`clean_metrics`、`normalize_ticker`、`call_with_timeout`（硬超时）、`fetch_with_retry`（重试 + 退避）、`ensure_ascii_ca`（中文路径 CA 引导） |
 | `src/tools/financial_data.py` | `AkshareProvider`（真实）+ `FakeProvider`（测试用）：最新期指标 + 杜邦上下文（权益乘数 / 恒等式自检）+ 口径标注 + 近 5 期趋势 |
 | `src/tools/industry_data.py` | `AkshareIndustryProvider`（真实）+ `FakeIndustryProvider`：所属板块（datacenter 行业层级 → 同花顺板块行情）+ 同业 2-3 家 PE/PB |
 | `src/tools/sentiment_data.py` | `AkshareSentimentProvider`（真实）+ `FakeSentimentProvider`：最近 10 条新闻（标题/摘要截断/发布时间，自行按时间倒序） |
 | `src/tools/technical_data.py` | `AkshareTechnicalProvider`（真实）+ `FakeTechnicalProvider`：近 120 交易日算 MA5/20/60、近 20 日涨跌幅、区间高低点、量比；**双源容灾**（新浪主源 + 东财自动 fallback） |
-| `scripts/smoke_multi_agent.py` | 两阶段真实冒烟：阶段一四源取数（不调 LLM，写快照），阶段二全图带真实 key 跑（读快照，不碰 akshare） |
+| `src/tools/valuation_data.py` | `AkshareValuationProvider`（真实）+ `FakeValuationProvider`（测试用）：PE(TTM) / PB 近三年历史分位（窗口 + 样本数 + 分位数定义 + 区间/中位）+ 行业估值对照（中上协口径），只输出计算事实 |
+| `scripts/smoke_multi_agent.py` | 两阶段真实冒烟：阶段一五源取数（不调 LLM，写快照），阶段二全图带真实 key 跑（读快照，不碰 akshare） |
 
 ### 节点流
 
 1. **planner**：把标的大纲拆成 4-6 个章节，每章 2-4 个可查证的研究问题。
-2. **四个分析师并行**（planner 之后同一批 fan-out，全部汇入 risk_review）：
+2. **五个分析师并行**（planner 之后同一批 fan-out，全部汇入 risk_review）：
    - `financial_analyst`：财务指标（roe / 净利率 / 负债率 / 营收增速 …）；
    - `industry_analyst`：所属行业板块、板块近期表现、同业估值对比；
    - `sentiment_analyst`：最近 10 条新闻（标题 + 摘要 + 发布时间）；
-   - `technical_analyst`：MA5/20/60、近 20 日涨跌幅、区间高低点、量比。
-   四者共用同一套模板：只依据给定数据下结论、`key_points` 标注 `data_source`、
+   - `technical_analyst`：MA5/20/60、近 20 日涨跌幅、区间高低点、量比；
+   - `valuation_analyst`：PE(TTM) / PB 当前值与近三年历史分位（附窗口起止、样本数、
+     区间、中位）与行业估值对照；只陈述计算事实，不做「贵 / 便宜」的定性判断
+     （定性交给风控与报告）。
+   五者共用同一套模板：只依据给定数据下结论、`key_points` 标注 `data_source`、
    缺失数据写进 `concerns`/`assumptions` 且禁止编造；有发给自己的质询时必须逐条
    正面回应并标记 `revised_in_round`，成功后只清空自己那一格 `pending_challenges`。
    - **幂等跳过**：若自己既无待办、`analyses` 里又已有结果 → 直接返回空 dict、
-     不调 LLM。这样返工轮可以无脑 fan-out 到四个分析师，本轮无事的自动空转。
-3. **risk_review**：以「反方辩手」身份审查四份分析，产出 `severity` + `challenges`
+     不调 LLM。这样返工轮可以无脑 fan-out 到五个分析师，本轮无事的自动空转。
+3. **risk_review**：以「反方辩手」身份审查五份分析，产出 `severity` + `challenges`
    + `summary`。审查清单五条：数据质疑 / 逻辑漏洞 / 反例寻找 / 假设压力测试 /
    确认偏误。`severity=high` 触发返工，最多 2 轮。
    - 打分标准：`high`=数据错误或口径错误、或已覆盖维度里的重大逻辑漏洞，应返工；
@@ -91,14 +98,17 @@ flowchart LR
    - 分析师返回 `unavailable` / 报错时，风控必须把这件事实列为 challenge 或在
      summary 里点名——「这份分析没有数据支撑」本身就是最重要的风险。
    - prompt 顶部有**时间锚点**（当前系统日期 + 「报告期晚于知识截止是正常情况，
-     属于真实数据」），并有**任务边界**说明：当前分析师为四个，
-     估值 / 宏观 / 政策等维度暂无数据源是已知边界，不应仅因覆盖不足就判 high。
-   - 四份分析序列化超过 6000 字符时只保留 `conclusion`/`confidence`/`status` 与
+     属于真实数据」），并有**任务边界**说明：当前分析师为五个，
+     宏观 / 政策等维度暂无数据源是已知边界，不应仅因覆盖不足就判 high。
+   - 五份分析序列化超过 6000 字符时只保留 `conclusion`/`confidence`/`status` 与
      每条分析前 4 个 `key_points`，防止 prompt 被撑爆。
 4. **revise**：把风控质询按 `target_agent` 分发进分析师的待办箱
    （`pending_challenges`），未知 target 归入 `unassigned` 而不是丢弃；
-   同时推进 `revision_round`，然后回到四个分析师。
-5. **finalize**：成稿（仍是占位，`final_report = "stub report"`）。
+   同时推进 `revision_round`，然后回到五个分析师。
+5. **finalize**：成稿——注入 `report_llm` 时合成 `ReportModel` 并渲染 Markdown
+   （LLM 不可用 / 校验失败 → `build_rule_based_report` 规则式兜底，并置
+   `report_llm_degraded=True`，保证各分析师与返工结果不丢）；未注入 `report_llm` 时
+   直接走规则式组装（本身就是合成降级路径）。
 
 ### 返工回环与保险丝
 
@@ -108,8 +118,8 @@ flowchart LR
 2. `severity == "high"` 但 `revision_round >= 2` → 停止返工，成稿（轮次上限）；
 3. `severity == "high"` 但连续两轮评审都没推进轮次（`stuck`）→ 停止返工，成稿；
 4. 否则进入 **revise**：把质询按 `target_agent` 分发到 `pending_challenges`，
-   然后回到四个分析师（无事者幂等跳过）→ 再次风控复审，批判循环闭环
-   （`risk_review --revise--> revise -> 四分析师 -> risk_review`）。
+   然后回到五个分析师（无事者幂等跳过）→ 再次风控复审，批判循环闭环
+   （`risk_review --revise--> revise -> 五分析师 -> risk_review`）。
 
 第 3 条是保险丝：只靠轮次兜底时，一旦将来调大上限或忘记推进轮次，图会一路撞到
 LangGraph 的 `recursion_limit` 抛异常；保险丝保证这种情况退化成「带缺陷成稿」。
@@ -161,6 +171,12 @@ LangGraph 的 `recursion_limit` 抛异常；保险丝保证这种情况退化成
   财务输出因此显式给出 `period_scale`（期间尺度）、`dupont`（权益乘数、`roe_implied_roa_x_em`、
   `identity_gap_pct` 恒等式自检）、`trend`（近 5 期趋势）、`caliber_notes`（口径标注）；
   风控 prompt 要求**先按恒等式验算再质疑口径**，验算通过不得再以口径矛盾质询。
+- **估值口径与历史分位**：PE(TTM) / PB 取自 `ak.stock_zh_valuation_baidu`（百度股市通口径），
+  近三年约 1097 个交易日；行业对照取自 `ak.stock_industry_pe_ratio_cninfo`（中上协口径，
+  静态 PE 的加权 / 中位与纳入家数）——**两者口径不同**（TTM vs 静态、个股 vs 行业加权），
+  不能直接相减当作「高估 / 低估」的幅度。输出必须携带可验算中间量：当前值、窗口起止、
+  样本数、分位数定义（≤ 当前值的样本占比）、区间与中位；估值层只给计算事实，
+  不引入外部评级或目标价结论。
 - **Windows 中文路径 CA 坑**：`curl_cffi` 底层 libcurl 无法从含中文的路径加载
   CAfile，报 `SSLError: curl: (77) error adding trust anchors from locations:
   CAfile: ...`——同一份 `cacert.pem` 放到 ASCII 路径后立刻恢复正常。`utils.ensure_ascii_ca()`
@@ -174,7 +190,7 @@ LangGraph 的 `recursion_limit` 抛异常；保险丝保证这种情况退化成
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-当前共 **126** 个测试，全部通过。
+当前共 **138** 个测试，全部通过。
 
 测试全部用 `FakeLLM` / `FakeProvider` / 假 akshare 模块，**不联网、不 import akshare**；
 `tests/conftest.py` 会清空 `DEEPSEEK_API_KEY`、把 `load_dotenv` 变成 no-op，
@@ -190,8 +206,8 @@ LangGraph 的 `recursion_limit` 抛异常；保险丝保证这种情况退化成
 | `tests/test_risk.py` | 风控 low 放行 / high 触发返工到上限 / 重试 / 降级不卡死 / 看得到 unavailable / prompt 含验算义务 |
 | `tests/test_revise_loop.py` | revise 按 target_agent 分发、分析师消费质询、返工环闭环 |
 | `tests/test_error_mapping.py` | openai 异常归类：500 / 503 / 401 / 超时 / 429 |
-| `tests/test_multi_agent.py` | 三个新 Agent 的 valid / transient / fatal / provider 故障 / 消费质询、幂等跳过、四分析师并行、定向返工、severity 下降 |
-| `tests/test_data_providers.py` | 行业 / 舆情 / 技术面清洗口径 + 硬超时降级 + 日线退避序列 + CA 引导 + 日线双源（主源优先 / 切 fallback / 双源皆败降级） |
+| `tests/test_multi_agent.py` | 四个新 Agent 的 valid / transient / fatal / provider 故障 / 消费质询、幂等跳过、五分析师并行、定向返工（含估值）、severity 下降 |
+| `tests/test_data_providers.py` | 行业 / 舆情 / 技术面清洗口径 + 硬超时降级 + 日线退避序列 + CA 引导 + 日线双源（主源优先 / 切 fallback / 双源皆败降级）+ 估值清洗与分位数（全链路 / 行业名缺失 / 行业表失败 / 样本不足 / 结构不符 / 分位数定义） |
 
 ### 真实链路冒烟（联网，消耗 token）
 
@@ -201,11 +217,11 @@ LangGraph 的 `recursion_limit` 抛异常；保险丝保证这种情况退化成
 .venv\Scripts\python.exe -u -X utf8 scripts\smoke_multi_agent.py --stage 2 > _smoke7_stage2.log 2>&1
 ```
 
-- **阶段一**：四个 Provider 分别真实取 300750（`--stage 1`，不调 LLM），逐个打印
-  耗时与可人工核对的摘要，并把结果写成 `_smoke7_snapshot.json`；单个源失败只记录、
-  不阻塞其余三个。
+- **阶段一**：五个 Provider 分别真实取 300750（`--stage 1`，不调 LLM），逐个打印
+  耗时与可人工核对的摘要，并把结果写成快照 json（`--snapshot`）；单个源失败只记录、
+  不阻塞其余四个。
 - **阶段二**：`--stage 2` 读快照跑全图（阶段二不碰 akshare），打印每轮 severity、
-  质询的 `target_agent` 分布、四个分析师的 `conclusion`/`confidence`、返工轮次与最终路径。
+  质询的 `target_agent` 分布、五个分析师的 `conclusion`/`confidence`、返工轮次与最终路径。
   指定 `--stage all` 可在同一进程里先 1 后 2。
 - 每行输出带 `[HH:MM:SS +Ns]` 时间戳，结束标记是 `SMOKE STAGE1 DONE` /
   `SMOKE STAGE2 DONE`（看到标记才说明整段跑完）；输出出现 key 明文即 exit 2。
@@ -246,7 +262,8 @@ invest-research-team/
 │       ├── financial_data.py
 │       ├── industry_data.py
 │       ├── sentiment_data.py
-│       └── technical_data.py
+│       ├── technical_data.py
+│       └── valuation_data.py
 ├── scripts/              # 真实链路冒烟脚本（联网）
 │   ├── smoke_multi_agent.py
 │   ├── smoke_risk.py
