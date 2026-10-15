@@ -383,7 +383,8 @@ def test_parallel_all_run():
     assert risk_llm.calls == 1
     assert result["revision_round"] == 0
     assert result["risk_review"]["severity"] == "low"
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
 
 
 def test_targeted_revision():
@@ -470,6 +471,7 @@ def test_severity_drops_multi():
     assert result["analyses"]["industry_analyst"]["confidence"] == "低"
     assert result["revision_round"] == 1
     assert result["risk_review"]["severity"] == "medium"
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
     assert result["pending_challenges"]["industry_analyst"] == []
     assert "revised_in_round=1" in risk_llm.messages[1][1]

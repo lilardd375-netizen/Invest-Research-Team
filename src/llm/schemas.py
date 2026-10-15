@@ -87,3 +87,55 @@ class RiskReviewModel(BaseModel):
     severity: Literal["high", "medium", "low"]
     challenges: list[Challenge] = Field(default_factory=list)
     summary: str = ""  # 一句话总评
+
+
+class AgentSummary(BaseModel):
+    """报告里对单个分析师的逐家呈现。
+
+    特意做成 list 而不是「四家合成一句话」：分歧本身是研究结论的一部分，
+    谁看多谁看空必须留在报告里，不允许被综合结论吞掉。
+    """
+
+    agent: str
+    status: str = "ok"  # ok / unavailable（数据源或 LLM 降级）
+    conclusion: str = ""  # 增持/中性/减持；unavailable 时为空
+    confidence: str = ""  # 高/中/低
+    summary: str = ""  # 一句话要点
+
+
+class RevisionRound(BaseModel):
+    """返工记录的一轮。
+
+    degraded=True 表示**该轮风控复核本身降级了**（网络/服务端故障），
+    此时 severity 是兜底写死的 low，不是真实评审结论——报告必须如实披露，
+    否则读者会把「没评」误当成「没问题」。
+    """
+
+    round: int = 0
+    severity: str = ""
+    degraded: bool = False
+    challenge_targets: dict[str, int] = Field(default_factory=dict)
+    revised_agents: list[str] = Field(default_factory=list)
+    note: str = ""
+
+
+class ReportModel(BaseModel):
+    """报告合成 Agent 的输出结构（第八步）。
+
+    约束：
+    - per_agent_summaries 必须逐家呈现（四家都出现），不许只给综合结论；
+    - revision_history 与 disclosures 是独立字段，渲染时也会独立成章；
+    - 不得引入四家结论之外的外部评级数据。
+    """
+
+    title: str
+    stock_code: str
+    report_date: str  # YYYY-MM-DD
+    overall_conclusion: Literal["增持", "中性", "减持"]
+    overall_confidence: Literal["高", "中", "低"]
+    per_agent_summaries: list[AgentSummary] = Field(default_factory=list)
+    key_thesis: list[str] = Field(default_factory=list)  # 3-5 条支撑逻辑
+    key_risks: list[str] = Field(default_factory=list)
+    revision_history: list[RevisionRound] = Field(default_factory=list)
+    disclosures: list[str] = Field(default_factory=list)
+    generated_at: str = ""

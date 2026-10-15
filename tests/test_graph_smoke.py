@@ -16,7 +16,8 @@ EXPECTED_FIELDS = [
 def test_graph_runs():
     app = build_graph()
     result = app.invoke({"query": "宁德时代"})
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
     assert result["query"] == "宁德时代"
     # 新图里 planner 之后接 risk_review：outline 仍是 planner 写的 "stub"
     assert result["outline"]["status"] == "stub"

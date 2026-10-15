@@ -119,7 +119,8 @@ def test_graph_with_injected_llm_runs():
 
     assert len(result["outline"]["sections"]) == 2
     assert result["risk_review"]["severity"] == "low"  # 缺省 low，直接成稿
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
     assert llm.calls == 1
 
 

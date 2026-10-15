@@ -11,6 +11,7 @@ from src.graph.nodes import (
     _missing_domain_analyst_stub_node,
     finalize_node,
     make_financial_analyst_node,
+    make_finalize_node,
     make_industry_analyst_node,
     make_planner_node,
     make_risk_review_node,
@@ -55,6 +56,7 @@ def build_graph(
     sentiment_llm=None,
     technical_llm=None,
     risk_llm=None,
+    report_llm=None,
     financial_provider=None,
     industry_provider=None,
     sentiment_provider=None,
@@ -69,6 +71,8 @@ def build_graph(
       该节点整体 skip：不写 analyses、不调 LLM。
     - risk_llm 为 None 时风控用占位节点（原样回显 severity）；传入时风控由真实 LLM
       评审，其 severity 真实驱动 revise/finalize 路由。
+    - report_llm 为 None 时 finalize 走规则式组装（不调 LLM，仍产出完整 Markdown
+      报告并标注 report_llm_degraded=True）；传入时由报告合成 LLM 产出 ReportModel。
     - data_provider 是 financial_provider 的旧参数名，仍然可用。
     """
     financial_provider = (
@@ -88,6 +92,7 @@ def build_graph(
         return factory(llm, provider)
 
     risk_fn = risk_review_node if risk_llm is None else make_risk_review_node(risk_llm)
+    report_fn = finalize_node if report_llm is None else make_finalize_node(report_llm)
 
     graph = StateGraph(ResearchState)
     graph.add_node("planner", planner_fn)
@@ -105,7 +110,7 @@ def build_graph(
     )
     graph.add_node("risk_review", risk_fn)
     graph.add_node("revise", revise_node)
-    graph.add_node("finalize", finalize_node)
+    graph.add_node("finalize", report_fn)
 
     graph.set_entry_point("planner")
     for name in ANALYST_NODES:

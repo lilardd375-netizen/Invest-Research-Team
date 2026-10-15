@@ -2,7 +2,7 @@
 
 import json
 import re
-from datetime import date
+from datetime import date, datetime
 
 from pydantic import ValidationError
 
@@ -11,10 +11,13 @@ from src.llm.schemas import (
     FinancialAnalysisModel,
     IndustryAnalysisModel,
     OutlineModel,
+    ReportModel,
     RiskReviewModel,
     SentimentAnalysisModel,
     TechnicalAnalysisModel,
 )
+from src.report.render import build_rule_based_report, render_report
+from src.tools.utils import normalize_ticker
 
 # 主编 Agent 的 system prompt（模块级常量，中文）。
 PLANNER_SYSTEM_PROMPT = """你是一名资深投资研究主编，负责为个股研究制定大纲。
@@ -177,6 +180,49 @@ MAX_CHALLENGES_IN_DIGEST = 8
 # 避免四个 Agent 全量输出把 prompt 撑爆。
 MAX_ANALYSES_JSON_CHARS = 6000
 MAX_KEY_POINTS_IN_DIGEST = 4
+
+# 报告合成 prompt 的质询历史上限：全部轮次合计最多 12 条（超了从旧轮开始丢，
+# 最新一轮全量保留），每条正文截断到 200 字符。按最坏情况设计，不依赖单次冒烟实测。
+MAX_CHALLENGES_TOTAL = 12
+CHALLENGE_TEXT_CHARS = 200
+# 合成 LLM 没有逐家呈现时，兜底补齐用的字段。
+REPORT_SUMMARY_FALLBACK = "（合成 LLM 未逐家呈现，此处按原始分析结果补齐）"
+
+# 报告合成 Agent 的 system prompt（模块级常量，中文）。
+REPORT_SYSTEM_PROMPT = """你是投资研究团队的报告主编，负责把四个分析师的结论、风控的多轮质询与返工记录，合成一份诚实的机构研究报告 JSON。
+
+硬性要求：
+1. 逐家呈现：per_agent_summaries 必须覆盖输入里出现的每一个分析师（财务/行业/舆情/技术面），
+   哪怕结论互相矛盾也要保留分歧，绝对不许只给一句「综合结论」把分歧吞掉。
+   status 为 unavailable 的分析师也要列出，conclusion 留空、summary 说明其不可用原因。
+2. 综合结论只能来自四家已有结论（多数且过半才给方向，票数分散就给「中性」），
+   不许引入任何外部评级数据。
+3. key_thesis 给 3-5 条支撑逻辑，key_risks 给主要风险（含风控质询里未解决的问题）。
+4. revision_history 必须照抄输入的每一轮：round / severity / degraded / challenge_targets /
+   revised_agents，degraded=true 的轮次要保留该标记，不许抹平成正常评审。
+5. disclosures 必须收编：全部 medium 质询、数据源或 LLM 降级情况、风控降级轮次、
+   假设与局限（覆盖边界：只有财务/行业/舆情/技术面四个维度，估值/宏观/政策无数据源）。
+6. 只输出 JSON，不要任何其他文字。
+
+输出 JSON 结构：
+{
+  "title": "报告标题",
+  "stock_code": "6 位代码",
+  "report_date": "YYYY-MM-DD",
+  "overall_conclusion": "增持/中性/减持",
+  "overall_confidence": "高/中/低",
+  "per_agent_summaries": [
+    {"agent": "financial_analyst", "status": "ok", "conclusion": "增持", "confidence": "中", "summary": "一句话要点"}
+  ],
+  "key_thesis": ["支撑逻辑"],
+  "key_risks": ["风险"],
+  "revision_history": [
+    {"round": 0, "severity": "high", "degraded": false, "challenge_targets": {"financial_analyst": 4},
+     "revised_agents": [], "note": "风控总评"}
+  ],
+  "disclosures": ["必须披露的事项"],
+  "generated_at": "ISO 时间"
+}"""
 
 # 已实现的分析师（revise 只把质询分发给它们，其余归 unassigned）。
 KNOWN_AGENTS = (
@@ -348,7 +394,9 @@ def _challenge_block(challenges) -> str:
         "== 上一轮风控质询（必须逐条正面回应）==\n"
         + "\n".join(lines)
         + "\n本轮分析必须正面回应上面每一条质询：修正表述、重算口径，"
-        "或明确说明为何不采纳，禁止无视。"
+        "或明确说明为何不采纳，禁止无视。\n"
+        "硬约束：对每条质询，必须要么给出重算/修正后的数值与依据，"
+        "要么明确说明无法修正及原因；禁止仅表态承认而不修正。"
     )
 
 
@@ -647,7 +695,7 @@ def make_risk_review_node(llm):
             },
         )
         review = payload.model_dump() if failure is None else failure["risk_review"]
-        result = _with_fuse(state, review)
+        result = _with_fuse(state, review, degraded=failure is not None)
         if failure is not None:
             # risk_review 里已带 error_kind/error，顶层再给一份摘要供下游消费
             result["risk_error"] = (
@@ -658,16 +706,67 @@ def make_risk_review_node(llm):
     return risk_review_node_with_llm
 
 
-def _with_fuse(state: dict, review: dict) -> dict:
+def _challenge_target_counts(challenges) -> dict:
+    """统计质询按 target_agent 的分布（报告「返工记录」章节用）。"""
+    counts: dict[str, int] = {}
+    for item in challenges or []:
+        if isinstance(item, dict):
+            target = (item.get("target_agent") or "").strip() or "unassigned"
+        else:
+            target = "unassigned"
+        counts[target] = counts.get(target, 0) + 1
+    return counts
+
+
+def _revised_this_round(state: dict, revision_round: int) -> list:
+    """本轮真正被返工改过的分析师（首轮不是返工，返回空列表）。"""
+    if revision_round <= 0:
+        return []
+    marks = []
+    for name, value in (state.get("analyses") or {}).items():
+        if isinstance(value, dict) and value.get("revised_in_round") == revision_round:
+            marks.append(name)
+    return sorted(marks)
+
+
+def _with_fuse(state: dict, review: dict, *, degraded: bool = False) -> dict:
     """占位节点的原有职责（保险丝），LLM 路径与占位路径共用。
 
     本轮 revision_round 与上次复核时相同 -> 上一轮返工没推进轮次，判定 stuck。
+
+    第八步新增两件事：
+    1. 把本轮评审追加进 review_history（risk_review 通道是 LastValue，最后一轮会
+       覆盖前几轮，报告需要逐轮留档才能写出「返工记录」章节）；
+    2. 显式标记 degraded —— 降级时写出的 severity 是兜底值，"没评成" 和
+       "评出来是 low" 必须在 state 里可区分，否则报告会把降级当成结论。
     """
     revision_round = state.get("revision_round", 0)
     stuck = revision_round == state.get("round_at_last_review", -1)
     merged = dict(review)
     merged["stuck"] = stuck
-    return {"risk_review": merged, "round_at_last_review": revision_round}
+    merged["degraded"] = degraded
+    challenges = [
+        dict(item)
+        if isinstance(item, dict)
+        else {"target_agent": "unassigned", "issue": str(item), "required_action": ""}
+        for item in (merged.get("challenges") or [])
+    ]
+    entry = {
+        "round": revision_round,
+        "severity": merged.get("severity", ""),
+        "degraded": degraded,
+        "summary": merged.get("summary", ""),
+        "challenges": challenges,
+        "challenge_targets": _challenge_target_counts(challenges),
+        "revised_agents": _revised_this_round(state, revision_round),
+    }
+    return {
+        "risk_review": merged,
+        "round_at_last_review": revision_round,
+        "risk_degraded": degraded,
+        "risk_degraded_round": revision_round if degraded else -1,
+        "review_history": [entry],
+    }
 
 
 def revise_node(state: dict) -> dict:
@@ -692,6 +791,216 @@ def revise_node(state: dict) -> dict:
     }
 
 
+def _truncate_text(text, limit: int = CHALLENGE_TEXT_CHARS) -> str:
+    """把一条质询正文压成单行并截断到上限。"""
+    flat = " ".join(str(text or "").split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1] + "…"
+
+
+def _history_entries(state: dict) -> list:
+    """取逐轮风控留档；没有时退化成当前 risk_review（兼容单节点调用与旧状态）。"""
+    history = [entry for entry in (state.get("review_history") or []) if isinstance(entry, dict)]
+    if history:
+        return history
+    review = state.get("risk_review") or {}
+    if not review:
+        return []
+    challenges = [item for item in (review.get("challenges") or []) if isinstance(item, dict)]
+    return [
+        {
+            "round": state.get("revision_round", 0),
+            "severity": review.get("severity", ""),
+            "degraded": bool(review.get("degraded")),
+            "summary": review.get("summary", ""),
+            "challenges": challenges,
+            "challenge_targets": _challenge_target_counts(challenges),
+            "revised_agents": [],
+        }
+    ]
+
+
+def _challenge_history_digest(state: dict) -> str:
+    """把全部轮次的风控质询压成 prompt 区块。
+
+    上限按最坏情况设计：全部轮次合计 ≤ MAX_CHALLENGES_TOTAL 条，
+    旧轮每个 target 只留 1 条代表，超限时从最早的开始丢（最新一轮全量保留），
+    每条正文截断到 CHALLENGE_TEXT_CHARS 字符。
+    """
+    history = _history_entries(state)
+    selected: list[tuple[int, dict]] = []
+    for index, entry in enumerate(history):
+        challenges = [item for item in (entry.get("challenges") or []) if isinstance(item, dict)]
+        round_no = int(entry.get("round", index) or 0)
+        if index == len(history) - 1:
+            selected.extend((round_no, item) for item in challenges)
+            continue
+        seen: set[str] = set()
+        for item in challenges:
+            target = (item.get("target_agent") or "").strip() or "unassigned"
+            if target in seen:
+                continue
+            seen.add(target)
+            selected.append((round_no, item))
+    dropped = max(0, len(selected) - MAX_CHALLENGES_TOTAL)
+    if dropped:
+        selected = selected[dropped:]
+    lines = []
+    for round_no, item in selected:
+        target = (item.get("target_agent") or "").strip() or "unassigned"
+        issue = _truncate_text(item.get("issue"))
+        action = _truncate_text(item.get("required_action"))
+        lines.append(f"- [第 {round_no} 轮][{target}] {issue}（要求：{action}）")
+    if not lines:
+        return "（没有任何轮次产生质询）"
+    if dropped:
+        lines.append(f"- …另有 {dropped} 条较早的质询按上限省略")
+    return "\n".join(lines)
+
+
+def _review_history_digest(state: dict) -> str:
+    """逐轮列出 severity / 质询分布 / 谁修订过 / 是否降级（合成报告要照抄）。"""
+    history = _history_entries(state)
+    if not history:
+        return "（还没有风控评审记录）"
+    lines = []
+    for entry in history:
+        targets = entry.get("challenge_targets") or _challenge_target_counts(entry.get("challenges"))
+        target_text = "、".join(f"{key} {value} 条" for key, value in targets.items()) or "无"
+        revised = "、".join(entry.get("revised_agents") or []) or "无"
+        flag = "（降级产物，非真实评审结论）" if entry.get("degraded") else ""
+        lines.append(
+            f"- 第 {entry.get('round', 0)} 轮：severity={entry.get('severity') or '—'}{flag}"
+            f"；质询分布：{target_text}；本轮修订者：{revised}"
+        )
+        summary = _truncate_text(entry.get("summary"))
+        if summary:
+            lines.append(f"  - 风控总评：{summary}")
+    return "\n".join(lines)
+
+
+def _build_report_user_prompt(state: dict) -> str:
+    """组装报告合成的 user prompt：四家输出 + 全部质询 + 逐轮 severity/返工记录。"""
+    ticker = extract_ticker(state.get("query", ""))
+    return (
+        f"当前系统日期：{date.today().isoformat()}。\n\n"
+        f"研究标的：{state.get('query', '')}（股票代码：{ticker}）\n\n"
+        "== 四个分析师的输出（JSON，含 unavailable/error）==\n"
+        f"{_analyses_digest(state.get('analyses'))}\n\n"
+        "== 研究大纲概要 ==\n"
+        f"{_outline_digest(state.get('outline'))}\n\n"
+        "== 全部轮次的风控质询（已按上限截断）==\n"
+        f"{_challenge_history_digest(state)}\n\n"
+        "== 每轮 severity 与返工记录（必须照抄进 revision_history）==\n"
+        f"{_review_history_digest(state)}\n\n"
+        f"风控降级标记：risk_degraded={bool(state.get('risk_degraded'))}，"
+        f"risk_degraded_round={state.get('risk_degraded_round', -1)}"
+        "（为 True 时该轮 severity 是兜底值，必须在 disclosures 里披露）。\n\n"
+        "请按 system 要求合成报告 JSON。"
+    )
+
+
+def _complete_report(report: dict, state: dict) -> dict:
+    """兜底补齐合成 LLM 可能漏掉的东西：逐家结论与返工记录都不许丢。"""
+    analyses = state.get("analyses") or {}
+    report = dict(report)
+    # 元信息以代码为准：合成 LLM 会自己编 generated_at（实测编出 00:00:00Z），不可信。
+    report["stock_code"] = str(report.get("stock_code") or "").strip() or (
+        normalize_ticker(state.get("query", "")) or "unknown"
+    )
+    report["report_date"] = str(report.get("report_date") or "").strip() or date.today().isoformat()
+    report["title"] = str(report.get("title") or "").strip() or f"{report['stock_code']} 投资研究报告"
+    report["generated_at"] = datetime.now().isoformat(timespec="seconds")
+    summaries = [item for item in (report.get("per_agent_summaries") or []) if isinstance(item, dict)]
+    present = {str(item.get("agent") or "") for item in summaries}
+    missing = [name for name in KNOWN_AGENTS if name in analyses and name not in present]
+    if missing:
+        for name in missing:
+            value = analyses.get(name) or {}
+            summaries.append(
+                {
+                    "agent": name,
+                    "status": str(value.get("status") or "ok"),
+                    "conclusion": str(value.get("conclusion") or ""),
+                    "confidence": str(value.get("confidence") or ""),
+                    "summary": REPORT_SUMMARY_FALLBACK,
+                }
+            )
+        report["per_agent_summaries"] = summaries
+        report["disclosures"] = list(report.get("disclosures") or []) + [
+            "报告合成 LLM 未逐家呈现下列分析师，已按原始结果补齐：" + "、".join(missing)
+        ]
+    if not (report.get("revision_history") or []) and _history_entries(state):
+        report["revision_history"] = [
+            {
+                "round": int(entry.get("round", 0) or 0),
+                "severity": str(entry.get("severity") or ""),
+                "degraded": bool(entry.get("degraded")),
+                "challenge_targets": dict(entry.get("challenge_targets") or {}),
+                "revised_agents": list(entry.get("revised_agents") or []),
+                "note": _truncate_text(entry.get("summary")),
+            }
+            for entry in _history_entries(state)
+        ]
+        report["disclosures"] = list(report.get("disclosures") or []) + [
+            "返工记录由 state 的 review_history 补齐（合成 LLM 未给出）。"
+        ]
+    return report
+
+
+def make_finalize_node(llm):
+    """成稿节点工厂：注入 report_llm，合成 ReportModel 并渲染 Markdown。
+
+    失败兜底：LLM 不可用 / 校验失败 -> build_rule_based_report 规则式组装，
+    写 report_llm_degraded=True —— 合成失败绝不允许丢掉四个分析师和两轮返工的结果。
+    """
+
+    def finalize_node_with_llm(state: dict) -> dict:
+        prompt = _build_report_user_prompt(state)
+        payload, failure = _retry_or_fail(
+            lambda: llm.chat(REPORT_SYSTEM_PROMPT, prompt),
+            ReportModel,
+            lambda kind, summary: {
+                "report_llm_degraded": True,
+                "report_error": f"{kind}: {summary}",
+            },
+        )
+        if failure is not None:
+            # 降级路径：把降级标记先塞进 state 再组装/渲染，否则报告里
+            # 「本报告为降级产物」的披露与横幅不会出现（合成失败却不披露＝骗读者）。
+            degraded_state = {
+                **state,
+                "report_llm_degraded": True,
+                "report_error": failure.get("report_error", ""),
+            }
+            rule_based = build_rule_based_report(degraded_state)
+            failure["report"] = rule_based
+            failure["final_report"] = render_report({**degraded_state, "report": rule_based})
+            return failure
+        report = _complete_report(payload.model_dump(), state)
+        return {
+            "report": report,
+            "final_report": render_report({**state, "report": report}),
+            "report_llm_degraded": False,
+            "report_error": "",
+        }
+
+    return finalize_node_with_llm
+
+
 def finalize_node(state: dict) -> dict:
-    """成稿节点（占位）。"""
-    return {"final_report": "stub report"}
+    """成稿节点（未注入 report_llm）：规则式组装报告并渲染 Markdown。
+
+    第八步起 finalize 不再是 stub：没有合成 LLM 也要产出完整报告，并显式标注
+    report_llm_degraded=True（规则式组装本身就是合成降级路径）。
+    """
+    note = "未启用报告合成 LLM：走规则式组装"
+    degraded_state = {**state, "report_llm_degraded": True, "report_error": note}
+    report = build_rule_based_report(degraded_state)
+    return {
+        "report": report,
+        "final_report": render_report({**degraded_state, "report": report}),
+        "report_llm_degraded": True,
+        "report_error": note,
+    }

@@ -91,7 +91,8 @@ def test_risk_low_finalize_path_in_full_graph():
 
     assert result["risk_review"]["severity"] == "low"
     assert result["revision_round"] == 0
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
     assert "risk_error" not in result
 
 
@@ -106,7 +107,8 @@ def test_risk_high_triggers_revise():
     assert result["risk_review"]["severity"] == "low"  # 第二轮放行
     assert result["risk_review"]["stuck"] is False
     assert result["round_at_last_review"] == 1  # 已回写为最新轮次
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
 
 
 def test_risk_high_until_cap():
@@ -118,7 +120,8 @@ def test_risk_high_until_cap():
     assert result["revision_round"] == 2  # MAX_REVISION_ROUNDS
     assert result["risk_review"]["severity"] == "high"
     assert result["round_at_last_review"] == 2
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
     assert llm.calls == 3  # 首轮 + 两轮返工后各复核一次
 
 
@@ -156,7 +159,8 @@ def test_risk_error_degrades_to_low():
     assert result["risk_review"]["severity"] == "low"
     assert result["risk_error"]
     assert "fatal" in result["risk_error"]
-    assert result["final_report"] == "stub report"  # 风控挂了不卡死报告
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")  # 风控挂了不卡死报告
     assert result["revision_round"] == 0
 
 
@@ -205,9 +209,12 @@ def test_risk_prompt_carries_review_context():
 
 def test_risk_stub_compat():
     """不传 risk_llm：旧占位行为不变（原样回显 severity）。"""
+    # 第八步：risk_review 里多了 degraded 标记（占位路径恒为 False），
+    # 用于把「降级写死的 low」与「真实评审的 low」区分开。
     assert risk_review_node({"revision_round": 0})["risk_review"] == {
         "severity": "low",
         "stuck": False,
+        "degraded": False,
     }
 
     out = risk_review_node(

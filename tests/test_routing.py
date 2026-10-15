@@ -16,7 +16,8 @@ def test_high_routes_to_revise():
     # 走了 revise 分支：revision_round 从 0 被推到上限 2
     # （severity 全程为 high，路由规则决定了会连续返工两轮才停）
     assert result["revision_round"] == 2
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
 
 
 def test_revision_cap():
@@ -30,7 +31,8 @@ def test_revision_cap():
         }
     )
     assert result["revision_round"] == 2  # 未再返工
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
 
 
 def test_low_routes_directly():
@@ -43,7 +45,8 @@ def test_low_routes_directly():
             "round_at_last_review": -1,
         }
     )
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
     assert result["revision_round"] == 0
 
 

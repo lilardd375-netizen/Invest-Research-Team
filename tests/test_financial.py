@@ -133,6 +133,7 @@ def test_graph_with_analyst_runs():
 
     assert result["analyses"]["financial_analyst"]["conclusion"] == "增持"
     assert result["risk_review"]["severity"] == "low"
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
     assert llm.calls == 1
     assert provider.calls == ["300750"]

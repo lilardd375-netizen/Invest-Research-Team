@@ -146,7 +146,8 @@ def test_severity_drops_after_revision():
     assert result["revision_round"] == 1
     assert result["analyses"]["financial_analyst"]["revised_in_round"] == 1
     assert result["analyses"]["financial_analyst"]["conclusion"] == "中性"
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
     assert "risk_error" not in result
     assert len(llm.risk_prompts) == 2
     # 复审 prompt 必须带上「上一轮质询 + 本轮返工标记」，否则风控无法判断是否被回应
@@ -171,7 +172,8 @@ def test_unknown_target_preserved():
     assert "估值维度没有数据源" not in llm.analyst_prompts[0]
     assert not pending.get("financial_analyst")
     assert result["revision_round"] == 1
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
 
 
 def test_cap_still_enforced():
@@ -187,7 +189,8 @@ def test_cap_still_enforced():
     assert len(llm.risk_prompts) == 3
     assert provider.calls == ["300750"] * 3
     assert result["risk_review"]["severity"] == "high"
-    assert result["final_report"] == "stub report"
+    # 第八步：finalize 不再是 stub，改为规则式组装并渲染 Markdown 报告
+    assert result["final_report"].startswith("# ")
 
 
 def test_stuck_guard_intact():
