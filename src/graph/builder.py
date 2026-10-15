@@ -1,5 +1,7 @@
 """按 LangGraph API 组装图：
-planner -> financial_analyst -> risk_review -> 条件路由 -> revise/finalize。
+planner -> financial_analyst -> risk_review -> 条件路由 -> revise/finalize，
+其中 revise 不回到风控，而是回到分析师（带质询重跑），形成
+risk_review --revise--> revise -> financial_analyst -> risk_review 的返工环。
 """
 
 from langgraph.graph import END, StateGraph
@@ -67,7 +69,7 @@ def build_graph(
         route_after_review,  # 路由函数：fn(state) -> 返回分支名
         {"revise": "revise", "finalize": "finalize"},  # 分支名->目标节点
     )
-    graph.add_edge("revise", "risk_review")  # 回环
+    graph.add_edge("revise", "financial_analyst")  # 返工回环：带着质询重跑分析师
     graph.add_edge("finalize", END)
     return graph.compile()
 

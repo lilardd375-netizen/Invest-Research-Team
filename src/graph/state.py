@@ -21,6 +21,8 @@ class ResearchState(TypedDict):
     planner_error: NotRequired[str]
     analyst_error: NotRequired[str]
     risk_error: NotRequired[str]
+    # revise 分发下来的待办质询：target_agent -> list[dict]
+    pending_challenges: NotRequired[dict]
 
 
 def merge_dict(left: Union[dict, None], right: Union[dict, None]) -> dict:

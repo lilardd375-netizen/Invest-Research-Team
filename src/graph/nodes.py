@@ -2,6 +2,7 @@
 
 import json
 import re
+from datetime import date
 
 from pydantic import ValidationError
 
@@ -68,9 +69,14 @@ RISK_REVIEW_SYSTEM_PROMPT = """你是投资研究团队里的反方辩手（风�
 5. 确认偏误：是否只找支持性的证据，而忽略了不利信息？
 
 打分标准（决定是否返工）：
-- high   = 存在数据错误或重大逻辑漏洞，结论不可采信，应返工；
+- high   = 存在数据错误或口径错误，或已覆盖维度里的重大逻辑漏洞，结论不可采信，应返工；
 - medium = 假设偏激进但可接受，报告中披露即可；
 - low    = 常规提示，并入风险章节即可。
+
+任务边界（已知，不是缺陷）：当前已实现的分析师只有 financial_analyst。
+大纲中其他板块暂无数据源是已知的任务边界：可以在 summary 或 challenges 里
+提示覆盖缺口，但不应仅因覆盖不足就把 severity 判为 high。
+severity=high 只用于：存在数据错误、口径错误、或已覆盖维度的逻辑漏洞。
 
 不确定时标注需要补充数据（写进 challenges 的 required_action），
 而不是武断下结论。特别地：如果某个分析 Agent 的数据缺失、返回
@@ -88,6 +94,13 @@ unavailable 或报错，必须把这件事本身列为 challenge，或在 summar
 
 # 送进风控 prompt 的章节标题上限（防止大纲过长把 prompt 撑爆）。
 MAX_OUTLINE_SECTIONS = 12
+
+# 送进复审 prompt 的上一轮质询条数上限。
+MAX_CHALLENGES_IN_DIGEST = 8
+
+# 已实现的分析师（revise 只把质询分发给它们，其余归 unassigned）。
+# 第七步实现行业/舆情/技术面 Agent 后在这里扩充。
+KNOWN_AGENTS = ("financial_analyst",)
 
 _TICKER_RE = re.compile(r"\d{6}")
 
@@ -168,11 +181,18 @@ def make_financial_analyst_node(llm, data_provider):
     流程：提取 ticker -> 取财务指标 -> 指标序列化进 user prompt ->
     llm.chat -> Pydantic 校验 -> {"analyses": {"financial_analyst": ...}}。
     Provider 抛异常时不调用 LLM，直接降级，不编造数据。
+
+    第六步新增：若 state["pending_challenges"] 里有发给本 Agent 的质询
+    （revise 分发而来），把质询追加进 user prompt 要求逐条正面回应，并在
+    产出里标记 revised_in_round；成功后把本 Agent 那一格的待办清空
+    （其他 Agent 的待办保留，避免被覆盖丢失）。
     """
 
     def financial_analyst_node(state: dict) -> dict:
         query = state.get("query", "")
         ticker = extract_ticker(query)
+        pending = dict(state.get("pending_challenges") or {})
+        challenges = pending.get("financial_analyst") or []
         try:
             financials = data_provider.get_financials(ticker)
         except Exception as exc:
@@ -195,6 +215,8 @@ def make_financial_analyst_node(llm, data_provider):
             f"{json.dumps(financials, ensure_ascii=False, default=str)}\n\n"
             "请基于以上指标输出分析 JSON。"
         )
+        if challenges:
+            user_prompt = f"{user_prompt}\n\n{_challenge_block(challenges)}"
         payload, failure = _retry_or_fail(
             lambda: llm.chat(FINANCIAL_ANALYST_SYSTEM_PROMPT, user_prompt),
             FinancialAnalysisModel,
@@ -211,11 +233,43 @@ def make_financial_analyst_node(llm, data_provider):
         )
         if failure is not None:
             # 降级时 failure 已是 {"analyses": {"financial_analyst": {...}}}
+            # 质询没被正面回应，就不清空待办（不当成已消费）。
             failure["analyst_error"] = failure["analyses"]["financial_analyst"]["error"]
             return failure
-        return {"analyses": {"financial_analyst": payload.model_dump()}}
+
+        analysis = payload.model_dump()
+        analysis["revised_in_round"] = state.get("revision_round", 0)
+        result = {"analyses": {"financial_analyst": analysis}}
+        if pending:
+            result["pending_challenges"] = _consume_pending(pending, "financial_analyst")
+        return result
 
     return financial_analyst_node
+
+
+def _challenge_block(challenges) -> str:
+    """把待回应的风控质询渲染成 prompt 区块。"""
+    lines = []
+    for idx, ch in enumerate(challenges, start=1):
+        if isinstance(ch, dict):
+            issue = (ch.get("issue") or "").strip()
+            action = (ch.get("required_action") or "").strip()
+        else:
+            issue, action = str(ch).strip(), ""
+        lines.append(f"{idx}. 问题：{issue}\n   要求：{action}")
+    return (
+        "== 上一轮风控质询（必须逐条正面回应）==\n"
+        + "\n".join(lines)
+        + "\n本轮分析必须正面回应上面每一条质询：修正表述、重算口径，"
+        "或明确说明为何不采纳，禁止无视。"
+    )
+
+
+def _consume_pending(pending: dict, agent: str) -> dict:
+    """消费掉某个 Agent 的待办质询，同时保留其他 Agent 的待办。"""
+    updated = dict(pending)
+    updated[agent] = []
+    return updated
 
 
 def _missing_llm_stub_node(state: dict) -> dict:
@@ -262,27 +316,65 @@ def _outline_digest(outline) -> str:
     return "\n".join(lines)
 
 
+def _previous_challenge_digest(review) -> str:
+    """把上一轮风控质询压成摘要，让复审能判断「质询是否被回应」。"""
+    challenges = (review or {}).get("challenges") or []
+    lines = []
+    for ch in challenges[:MAX_CHALLENGES_IN_DIGEST]:
+        if not isinstance(ch, dict):
+            lines.append(f"- [unassigned] {ch}")
+            continue
+        target = ch.get("target_agent") or "unassigned"
+        issue = (ch.get("issue") or "").strip()
+        action = (ch.get("required_action") or "").strip()
+        lines.append(f"- [{target}] {issue}（要求：{action}）")
+    if not lines:
+        return "（上一轮没有质询）"
+    if len(challenges) > MAX_CHALLENGES_IN_DIGEST:
+        lines.append(f"- …另有 {len(challenges) - MAX_CHALLENGES_IN_DIGEST} 条未列出")
+    return "\n".join(lines)
+
+
+def _revised_marks(analyses) -> str:
+    """列出各分析师本轮的 revised_in_round 标记（判断质询是否被回应）。"""
+    marks = []
+    for name, value in (analyses or {}).items():
+        if isinstance(value, dict) and "revised_in_round" in value:
+            marks.append(f"- {name}: revised_in_round={value['revised_in_round']}")
+    return "\n".join(marks) if marks else "（本轮没有分析师标记返工轮次）"
+
+
 def _build_risk_user_prompt(state: dict) -> str:
-    """组装风控的 user prompt：query / analyses / outline 概要 / 复审上下文。"""
-    previous = (state.get("risk_review") or {}).get("severity")
+    """组装风控 user prompt：时间锚点 / query / analyses / outline / 复审上下文。"""
+    previous_review = state.get("risk_review") or {}
+    previous = previous_review.get("severity")
     revision_round = state.get("revision_round", 0)
+    analyses = state.get("analyses") or {}
+
     if previous:
+        prev_count = len(previous_review.get("challenges") or [])
         round_hint = (
             f"这是第 {revision_round} 轮返工后的复审"
-            f"（上一轮风控结论：{previous}）。请重点确认上一轮的问题是否已解决，"
-            "以及返工是否引入了新的问题。"
+            f"（上一轮风控结论：{previous}，上一轮质询 {prev_count} 条）。"
+            "请重点确认上一轮的问题是否已解决，以及返工是否引入了新的问题。"
         )
     else:
         round_hint = f"这是首轮评审（revision_round={revision_round}）。"
 
     return (
+        f"当前系统日期：{date.today().isoformat()}。"
+        "数据来自 akshare 实时接口，报告期晚于你的知识截止是正常情况，"
+        "属于真实数据，不要因数据较新而质疑其真实性；"
+        "如有疑问请质疑数据口径，而非数据存在性。\n\n"
         f"研究标的：{state.get('query', '')}\n\n"
         "== 各分析 Agent 的输出（JSON，含 unavailable/error 信息）==\n"
-        f"{json.dumps(state.get('analyses') or {}, ensure_ascii=False, default=str)}\n\n"
+        f"{json.dumps(analyses, ensure_ascii=False, default=str)}\n\n"
         "== 研究大纲概要 ==\n"
         f"{_outline_digest(state.get('outline'))}\n\n"
         "== 评审上下文 ==\n"
-        f"{round_hint}\n\n"
+        f"{round_hint}\n"
+        f"上一轮质询摘要：\n{_previous_challenge_digest(previous_review)}\n"
+        f"本轮分析师返工标记：\n{_revised_marks(analyses)}\n\n"
         "请按审查清单质询以上分析，输出评审 JSON。"
     )
 
@@ -340,11 +432,25 @@ def _with_fuse(state: dict, review: dict) -> dict:
 
 
 def revise_node(state: dict) -> dict:
-    """返工节点（占位）。
+    """返工节点：把风控质询按 target_agent 分发到各分析师的待办箱。
 
-    本步只推进轮次，不把 challenges 发回分析师重新分析——那是第六步。
+    - 只分发给已实现的分析师（KNOWN_AGENTS），其余 target 一律归入
+      "unassigned" 而不是丢弃——未知目标本身就是需要人看的覆盖问题；
+    - 同时推进 revision_round（stuck 保险丝依赖这个，不能丢）；
+    - 不再返回空的 final_report 或其他副作用。
     """
-    return {"revision_round": state["revision_round"] + 1}
+    challenges = (state.get("risk_review") or {}).get("challenges") or []
+    pending: dict[str, list[dict]] = {}
+    for ch in challenges:
+        if not isinstance(ch, dict):
+            ch = {"target_agent": "unassigned", "issue": str(ch), "required_action": ""}
+        target = (ch.get("target_agent") or "").strip()
+        bucket = target if target in KNOWN_AGENTS else "unassigned"
+        pending.setdefault(bucket, []).append(ch)
+    return {
+        "revision_round": state.get("revision_round", 0) + 1,
+        "pending_challenges": pending,
+    }
 
 
 def finalize_node(state: dict) -> dict:
