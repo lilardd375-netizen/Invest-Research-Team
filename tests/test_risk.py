@@ -3,7 +3,7 @@
 import json
 
 from src.graph.builder import build_graph
-from src.graph.nodes import make_risk_review_node, risk_review_node
+from src.graph.nodes import RISK_REVIEW_SYSTEM_PROMPT, make_risk_review_node, risk_review_node
 from src.llm.errors import LLMFatalError, LLMTransientError
 
 VALID_HIGH = json.dumps(
@@ -229,3 +229,11 @@ def test_risk_stub_compat():
         {"risk_review": {"severity": "high"}, "revision_round": 2, "round_at_last_review": 2}
     )
     assert stuck["risk_review"]["stuck"] is True
+
+
+def test_risk_prompt_requires_identity_check():
+    """第九步任务 1：质疑口径前必须先验算恒等式，验算通过不许再以口径矛盾质询。"""
+    assert "验算" in RISK_REVIEW_SYSTEM_PROMPT
+    assert "偏差在 5% 以内" in RISK_REVIEW_SYSTEM_PROMPT
+    assert "不得再以口径矛盾为由质询" in RISK_REVIEW_SYSTEM_PROMPT
+    assert "非年化" in RISK_REVIEW_SYSTEM_PROMPT or "年化值" in RISK_REVIEW_SYSTEM_PROMPT

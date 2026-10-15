@@ -155,3 +155,120 @@ def test_provider_raises_on_empty_or_bad_structure(patch_akshare):
     patch_akshare(_df([{"日期": "不是日期", "净资产收益率(%)": 1.0}]))
     with pytest.raises(RuntimeError, match="报告期列无法解析"):
         AkshareProvider().get_financials("300750")
+
+
+# ---------------------------------------------------------------------------
+# 第九步任务 1：口径自洽诊断的落地——杜邦上下文、口径标注、多期趋势
+# ---------------------------------------------------------------------------
+
+
+class TestPeriodScale:
+    def test_scale_follows_report_month(self):
+        from src.tools.financial_data import period_scale
+
+        assert "半年报" in period_scale("2026-06-30")
+        assert "一季报" in period_scale("2026-03-31")
+        assert "年报" in period_scale("2025-12-31")
+        assert "非年化" in period_scale("2026-09-30")
+
+
+class TestDupontContext:
+    def test_real_numbers_are_self_consistent(self):
+        """300750 真实数据：ROE ≈ 总资产利润率 × 权益乘数，偏差 < 1%。"""
+        from src.tools.financial_data import dupont_context
+
+        ctx = dupont_context(
+            {"roe": 11.41, "roa": 4.1295, "net_margin": 16.9837, "debt_ratio": 63.6525}
+        )
+        assert ctx["equity_multiplier"] == pytest.approx(2.7512, abs=1e-3)
+        assert ctx["roe_implied_roa_x_em"] == pytest.approx(11.36, abs=0.05)
+        assert ctx["identity_gap_pct"] < 1
+
+    def test_missing_inputs_are_omitted_not_guessed(self):
+        from src.tools.financial_data import dupont_context
+
+        assert dupont_context({"roe": 11.41}) == {"roe": 11.41}
+
+
+class TestCaliberNotes:
+    def test_notes_cover_scale_and_caliber_mixing(self):
+        from src.tools.financial_data import caliber_notes
+
+        blob = "".join(
+            caliber_notes({"roa": 4.1295, "roe": 11.41, "roe_weighted": 12.08}, "2026-06-30")
+        )
+        assert "非年化" in blob
+        assert "利润总额" in blob  # 两种 ROA 口径
+        assert "加权" in blob  # 摊薄 vs 加权
+        assert "归母" in blob  # 归母 vs 全部权益
+        assert "权益乘数" in blob  # 恒等式写入 prompt
+
+
+def test_provider_outputs_dupont_trend_and_caliber(patch_akshare):
+    """真实接口同源字段：杜邦上下文 + 多期趋势 + 口径标注一次给全。"""
+    df = _df(
+        [
+            {
+                "日期": "2025-12-31",
+                "净资产收益率(%)": 21.42,
+                "总资产利润率(%)": 7.8769,
+                "销售净利率(%)": 18.1227,
+                "资产负债率(%)": 61.9393,
+                "主营业务收入增长率(%)": 17.0406,
+            },
+            {
+                "日期": "2026-03-31",
+                "净资产收益率(%)": 5.8,
+                "总资产利润率(%)": 2.1731,
+                "销售净利率(%)": 17.6079,
+                "资产负债率(%)": 62.3223,
+                "主营业务收入增长率(%)": 52.4487,
+            },
+            {
+                "日期": "2026-06-30",
+                "净资产收益率(%)": 11.41,
+                "总资产利润率(%)": 4.1295,
+                "销售净利率(%)": 16.9837,
+                "资产负债率(%)": 63.6525,
+                "主营业务收入增长率(%)": 54.8004,
+                "总资产净利润率(%)": 4.4501,
+                "总资产周转率(次)": 0.262,
+                "股东权益比率(%)": 36.3475,
+                "加权净资产收益率(%)": 12.08,
+            },
+        ]
+    )
+    patch_akshare(df)
+    out = AkshareProvider().get_financials("300750")
+
+    assert out["dupont"]["equity_multiplier"] == pytest.approx(2.7512, abs=1e-3)
+    assert out["dupont"]["total_asset_turnover"] == 0.262
+    assert out["dupont"]["identity_gap_pct"] < 1
+    assert out["period_scale"].startswith("半年报")
+    assert [item["period"] for item in out["trend"]] == [
+        "2025-12-31",
+        "2026-03-31",
+        "2026-06-30",
+    ]
+    assert out["trend"][-1]["roe"] == 11.41
+    assert any("归母" in note for note in out["caliber_notes"])
+    json.dumps(out, ensure_ascii=False)  # 可序列化
+
+
+def test_provider_trend_caps_at_five_periods(patch_akshare):
+    rows = [{"日期": f"20{20 + i}-12-31", "净资产收益率(%)": 10.0 + i} for i in range(8)]
+    patch_akshare(_df(rows))
+    out = AkshareProvider().get_financials("300750")
+
+    assert len(out["trend"]) == 5
+    assert [item["roe"] for item in out["trend"]] == [13.0, 14.0, 15.0, 16.0, 17.0]
+
+
+def test_provider_without_trend_columns_still_works(patch_akshare):
+    """缺趋势 / 杜邦列时不崩，只是不给这些上下文。"""
+    patch_akshare(_df([{"日期": "2026-06-30", "净资产收益率(%)": 11.41}]))
+    out = AkshareProvider().get_financials("300750")
+
+    assert out["dupont"] == {"roe": 11.41}
+    assert out["trend"] == [{"period": "2026-06-30", "roe": 11.41}]
+    assert isinstance(out["caliber_notes"], list) and out["caliber_notes"]

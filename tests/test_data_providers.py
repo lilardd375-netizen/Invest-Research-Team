@@ -4,7 +4,9 @@
 - stock_news_em 行序不是时间序（最新一条落在中间）→ 必须自己按发布时间倒序；
 - stock_zh_a_hist 行序不保证、日期是字符串、收盘 NaN → 必须排序 + dropna；
 - 字段名/结构变动 → 必须显式报错而不是静默产出错结论；
-- 板块表现优先同花顺口径，同业取板块成分股（剔除自己）。
+- 板块表现优先同花顺口径，同业取板块成分股（剔除自己）；
+- 日线双源容灾（第九步）：新浪 stock_zh_a_daily 为主（symbol 要带 sz/sh 前缀、英文列名），
+  东财 stock_zh_a_hist 为自动 fallback，两源都失败才降级 unavailable。
 """
 
 import json
@@ -185,6 +187,99 @@ def test_technical_missing_columns_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="结构"):
         AkshareTechnicalProvider().get_technical("300750")
+
+
+def _sina_frame(rows):
+    """新浪日线帧：英文列名（实测 9 列），symbol 需要 sz/sh 前缀。"""
+    return pd.DataFrame(
+        [
+            {
+                "date": row[0],
+                "open": row[2],
+                "high": row[4],
+                "low": row[5],
+                "close": row[3],
+                "volume": row[6],
+                "amount": 1.0,
+                "outstanding_share": 1.0,
+                "turnover": 0.01,
+            }
+            for row in rows
+        ]
+    )
+
+
+def test_technical_prefers_sina_primary(monkeypatch):
+    """主源（新浪）可用时不碰东财，并在输出里标注实际口径。"""
+    rows = _bars()
+    symbols: list[str] = []
+
+    def sina_daily(**kwargs):
+        symbols.append(kwargs["symbol"])
+        return _sina_frame(rows)
+
+    _fake_akshare(
+        monkeypatch,
+        stock_zh_a_daily=sina_daily,
+        stock_zh_a_hist=lambda **kwargs: pytest.fail("主源可用时不应调用东财 fallback"),
+    )
+
+    data = AkshareTechnicalProvider().get_technical("300750")
+
+    assert symbols == ["sz300750"]  # 新浪要求带市场前缀（实测 '300750' 会 KeyError）
+    assert data["source"] == "akshare:stock_zh_a_daily(新浪,qfq)"
+    assert data["fallback_used"] is False
+    assert data["primary_error"] is None
+    assert data["window"]["rows"] == 120
+    assert data["as_of"] == rows[-1][0]
+    assert data["ma5"] == pytest.approx(sum(row[3] for row in rows[-5:]) / 5)
+    assert json.dumps(data, ensure_ascii=False)
+
+
+def test_technical_falls_back_to_eastmoney(monkeypatch):
+    """主源连抛断连（第七步实测就是这样）→ 自动切东财，并记录主源错误。"""
+    monkeypatch.setattr(utils.time, "sleep", lambda _seconds: None)  # 跳过主源 23s 退避，别真等
+    rows = _bars()
+
+    def sina_down(**kwargs):
+        raise ConnectionError("Remote end closed connection without response")
+
+    _fake_akshare(
+        monkeypatch,
+        stock_zh_a_daily=sina_down,
+        stock_zh_a_hist=lambda **kwargs: _hist_frame(rows),
+    )
+
+    data = AkshareTechnicalProvider().get_technical("300750")
+
+    assert data["source"] == "akshare:stock_zh_a_hist(东财,qfq)"
+    assert data["fallback_used"] is True
+    assert "ConnectionError" in data["primary_error"]
+    assert data["window"]["rows"] == 120
+    assert data["ma60"] == pytest.approx(sum(row[3] for row in rows[-60:]) / 60)
+
+
+def test_technical_both_sources_fail_degrades_to_unavailable(monkeypatch):
+    """双源都失败 → 抛 RuntimeError；节点按既有路径降级，且不把空数据喂给 LLM。"""
+    monkeypatch.setattr(utils.time, "sleep", lambda _seconds: None)  # 别真等 23s 退避
+
+    def down(**kwargs):
+        raise ConnectionError("Remote end closed connection without response")
+
+    _fake_akshare(monkeypatch, stock_zh_a_daily=down, stock_zh_a_hist=down)
+
+    with pytest.raises(RuntimeError, match="双源均失败"):
+        AkshareTechnicalProvider().get_technical("300750")
+
+    llm = _FakeLLM()
+    app = build_graph(technical_llm=llm, technical_provider=AkshareTechnicalProvider())
+    final = app.invoke({"query": "宁德时代 300750 的投资价值"})
+
+    payload = final["analyses"]["technical_analyst"]
+    assert payload["status"] == "unavailable"
+    assert payload["error_kind"] == "data_source"
+    assert "双源均失败" in final["analyst_errors"]["technical_analyst"]
+    assert llm.calls == 0
 
 
 # --------------------------------------------------------------------------- 行业

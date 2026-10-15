@@ -64,10 +64,10 @@ flowchart LR
 | `src/llm/schemas.py` | Pydantic 输出契约：`OutlineModel`、`AnalysisBase`（`conclusion`/`confidence`/`key_points`/`concerns`/`assumptions`）+ `FinancialAnalysisModel` / `IndustryAnalysisModel` / `SentimentAnalysisModel` / `TechnicalAnalysisModel`、`RiskReviewModel`（`Challenge`） |
 | `src/llm/errors.py` | `LLMTransientError`（可重试）/ `LLMFatalError`（不可重试） |
 | `src/tools/utils.py` | 数据层公共机制：`clean_value`、`period_key`、`pick_latest_row`、`clean_metrics`、`normalize_ticker`、`call_with_timeout`（硬超时）、`fetch_with_retry`（重试 + 退避）、`ensure_ascii_ca`（中文路径 CA 引导） |
-| `src/tools/financial_data.py` | `AkshareProvider`（真实）+ `FakeProvider`（测试用） |
+| `src/tools/financial_data.py` | `AkshareProvider`（真实）+ `FakeProvider`（测试用）：最新期指标 + 杜邦上下文（权益乘数 / 恒等式自检）+ 口径标注 + 近 5 期趋势 |
 | `src/tools/industry_data.py` | `AkshareIndustryProvider`（真实）+ `FakeIndustryProvider`：所属板块（datacenter 行业层级 → 同花顺板块行情）+ 同业 2-3 家 PE/PB |
 | `src/tools/sentiment_data.py` | `AkshareSentimentProvider`（真实）+ `FakeSentimentProvider`：最近 10 条新闻（标题/摘要截断/发布时间，自行按时间倒序） |
-| `src/tools/technical_data.py` | `AkshareTechnicalProvider`（真实）+ `FakeTechnicalProvider`：近 120 交易日算 MA5/20/60、近 20 日涨跌幅、区间高低点、量比 |
+| `src/tools/technical_data.py` | `AkshareTechnicalProvider`（真实）+ `FakeTechnicalProvider`：近 120 交易日算 MA5/20/60、近 20 日涨跌幅、区间高低点、量比；**双源容灾**（新浪主源 + 东财自动 fallback） |
 | `scripts/smoke_multi_agent.py` | 两阶段真实冒烟：阶段一四源取数（不调 LLM，写快照），阶段二全图带真实 key 跑（读快照，不碰 akshare） |
 
 ### 节点流
@@ -149,6 +149,18 @@ LangGraph 的 `recursion_limit` 抛异常；保险丝保证这种情况退化成
   ——同一 300 日窗口第 1、2 次成功，第 3 次起连小窗口也 `RemoteDisconnected`，
   隔约 1 分钟新进程首次调用即恢复。故日线用 1.5/3/6/12 秒递增退避（5 次尝试，
   总耐心约 23 秒），兜不住就走 unavailable 降级并如实标注。
+- **技术面双源容灾**：主源 `ak.stock_zh_a_daily`（新浪，qfq；symbol 必须带 `sz`/`sh` 前缀，
+  列名是英文 `date/open/high/low/close/volume/...`，实测 300750 取 187 行只要 ~2s），
+  东财 `stock_zh_a_hist` 降为**自动 fallback**：主源任一环节失败（重试耗尽 / 超时 / 列不符）
+  就切 fallback，**两源各自**套用同一 20s 超时与同一退避序列（最坏 23s + 23s），
+  两源都失败才降级 unavailable。输出用 `source` / `fallback_used` / `primary_error` 标注实际口径；
+  两源复权因子有细微差异，对 MA / 涨跌幅 / 量比这类相对指标可接受，**不做交叉校正**。
+- **财务口径**：同一张接口表里混着不同口径族——`总资产利润率(%)` 是**利润总额**口径、
+  `总资产净利润率(%)` 是**净利润**口径；`净资产收益率(%)` 是**摊薄**、`加权净资产收益率(%)` 是加权；
+  现金流量表口径按**全部权益**、资产负债表口径按**归母**（两者相差约 7%）；半年报指标**未年化**。
+  财务输出因此显式给出 `period_scale`（期间尺度）、`dupont`（权益乘数、`roe_implied_roa_x_em`、
+  `identity_gap_pct` 恒等式自检）、`trend`（近 5 期趋势）、`caliber_notes`（口径标注）；
+  风控 prompt 要求**先按恒等式验算再质疑口径**，验算通过不得再以口径矛盾质询。
 - **Windows 中文路径 CA 坑**：`curl_cffi` 底层 libcurl 无法从含中文的路径加载
   CAfile，报 `SSLError: curl: (77) error adding trust anchors from locations:
   CAfile: ...`——同一份 `cacert.pem` 放到 ASCII 路径后立刻恢复正常。`utils.ensure_ascii_ca()`
@@ -162,7 +174,7 @@ LangGraph 的 `recursion_limit` 抛异常；保险丝保证这种情况退化成
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-当前共 **92** 个测试，全部通过。
+当前共 **126** 个测试，全部通过。
 
 测试全部用 `FakeLLM` / `FakeProvider` / 假 akshare 模块，**不联网、不 import akshare**；
 `tests/conftest.py` 会清空 `DEEPSEEK_API_KEY`、把 `load_dotenv` 变成 no-op，
@@ -174,12 +186,12 @@ LangGraph 的 `recursion_limit` 抛异常；保险丝保证这种情况退化成
 | `tests/test_routing.py` | 条件路由、返工上限、卡住保险丝 |
 | `tests/test_planner.py` | planner 正常 / 重试 / 降级 / 401 不重试、缺 key 报错 |
 | `tests/test_financial.py` | 财务 Agent 正常 / 重试 / 降级 / 数据源故障不调 LLM |
-| `tests/test_financial_data.py` | 财务数据层：NaN 与前导期清洗、取最新报告期、缺指标报错 |
-| `tests/test_risk.py` | 风控 low 放行 / high 触发返工到上限 / 重试 / 降级不卡死 / 看得到 unavailable |
+| `tests/test_financial_data.py` | 财务数据层：NaN 与前导期清洗、取最新报告期、缺指标报错、期间尺度、杜邦上下文与恒等式自检、口径标注、近 5 期趋势 |
+| `tests/test_risk.py` | 风控 low 放行 / high 触发返工到上限 / 重试 / 降级不卡死 / 看得到 unavailable / prompt 含验算义务 |
 | `tests/test_revise_loop.py` | revise 按 target_agent 分发、分析师消费质询、返工环闭环 |
 | `tests/test_error_mapping.py` | openai 异常归类：500 / 503 / 401 / 超时 / 429 |
 | `tests/test_multi_agent.py` | 三个新 Agent 的 valid / transient / fatal / provider 故障 / 消费质询、幂等跳过、四分析师并行、定向返工、severity 下降 |
-| `tests/test_data_providers.py` | 行业 / 舆情 / 技术面清洗口径 + 硬超时降级 + 日线退避序列 + CA 引导 |
+| `tests/test_data_providers.py` | 行业 / 舆情 / 技术面清洗口径 + 硬超时降级 + 日线退避序列 + CA 引导 + 日线双源（主源优先 / 切 fallback / 双源皆败降级） |
 
 ### 真实链路冒烟（联网，消耗 token）
 
